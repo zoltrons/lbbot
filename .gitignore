@@ -1,0 +1,7 @@
+/target
+.env
+.DS_Store
+
+# Internal reports, not published
+docs/*
+!docs/how-it-works.md
