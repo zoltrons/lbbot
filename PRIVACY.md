@@ -10,7 +10,7 @@ When you run `/login`:
 
 - A keyed hash of your Discord user ID, never the ID itself. The hash is made with the bot's secret key, so without that key nobody can tell which Discord account a row belongs to.
 - Your ListenBrainz username.
-- Your ListenBrainz user token, encrypted (see [SECURITY.md](SECURITY.md)), only until your history has been downloaded. The bot needs it to request your export, and deletes it as soon as that download is done.
+- Your ListenBrainz user token, encrypted (see [SECURITY.md](SECURITY.md)), only until your history has been downloaded. The bot needs it to request your export, and deletes it as soon as that download is done. It then tells you, as a reply to your `/login` or, after 15 minutes, in a direct message. Your Discord ID is only kept in memory for that message.
 
 After login, the bot downloads your ListenBrainz history and keeps:
 

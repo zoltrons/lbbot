@@ -51,14 +51,21 @@ impl Ingest {
     pub fn spawn_index(self: &Arc<Self>, user_id: i32) {
         let this = self.clone();
         tokio::spawn(async move {
-            let Some(_guard) = this.claim(user_id) else { return };
-            if let Err(e) = this.index(user_id).await {
-                tracing::error!(user_id, error = ?e, "index failed");
-            }
+            let _ = this.index_now(user_id).await;
         });
     }
 
-    async fn index(&self, user_id: i32) -> Result<()> {
+    /// Runs a full index and returns how many listens are stored; `None` if another job holds the user.
+    pub async fn index_now(&self, user_id: i32) -> Result<Option<i32>> {
+        let Some(_guard) = self.claim(user_id) else { return Ok(None) };
+        let result = self.index(user_id).await;
+        if let Err(e) = &result {
+            tracing::error!(user_id, error = ?e, "index failed");
+        }
+        result.map(Some)
+    }
+
+    async fn index(&self, user_id: i32) -> Result<i32> {
         // Marked after the claim is taken: if it is cut off, it starts again at boot and on `.update`.
         self.db.mark_unindexed(user_id).await?;
         let user = self.db.user(user_id).await?;
@@ -78,7 +85,8 @@ impl Ingest {
         let lb_count = self.lb.listen_count(&user.lb_name, Prio::Background).await?;
         let rest = self.pages(&user.lb_name, user.last_ts, Prio::Background).await?;
         self.db.store(user_id, rest, false).await?;
-        self.db.finish_index(user_id, lb_count).await
+        self.db.finish_index(user_id, lb_count).await?;
+        Ok(self.db.user(user_id).await?.listens)
     }
 
     /// `update` plus a comparison with LB's total count. After a backdated import or a deletion the counts

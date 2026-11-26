@@ -19,7 +19,7 @@ use twilight_model::{
         Message,
         message::{
             Component, Embed, MessageFlags,
-            component::{Label, TextInput, TextInputStyle},
+            component::{Label, TextDisplay, TextInput, TextInputStyle},
         },
     },
     gateway::payload::outgoing::RequestGuildMembers,
@@ -37,6 +37,7 @@ use twilight_util::builder::{
 use crate::{db::{Db, Kind}, ingest::Ingest};
 
 const DEFAULT_PREFIX: &str = ".";
+const SETTINGS: &str = "[listenbrainz.org/settings](https://listenbrainz.org/settings/)";
 const COLOR: u32 = 0x353070;
 
 pub struct Bot {
@@ -308,13 +309,19 @@ impl Bot {
                         style: TextInputStyle::Short,
                         value: None,
                     };
+                    let help = TextDisplay {
+                        content: format!(
+                            "Copy your **User token** from {SETTINGS}. It's stored encrypted, used once to download your history, and deleted when that's done."
+                        ),
+                        id: None,
+                    };
                     let label = Label {
                         component: Box::new(Component::TextInput(input)),
-                        description: Some("Stored encrypted. Used to download your history as an export.".into()),
+                        description: None,
                         id: None,
                         label: "ListenBrainz token".into(),
                     };
-                    let resp = ModalBuilder::new("login", "Connect to ListenBrainz", [Component::Label(label)]).build();
+                    let resp = ModalBuilder::new("login", "Connect to ListenBrainz", [Component::TextDisplay(help), Component::Label(label)]).build();
                     client.create_response(i.id, &i.token, &resp).await?;
                     return Ok(());
                 }
@@ -326,7 +333,7 @@ impl Bot {
             Some(InteractionData::ModalSubmit(data)) if data.custom_id == "login" => {
                 self.defer(i, true).await?;
                 let token = data.components.iter().find_map(text_value).unwrap_or_default();
-                let out = self.login(&ctx, token.trim()).await.unwrap_or_else(error_reply);
+                let out = self.login(&ctx, token.trim(), &i.token).await.unwrap_or_else(error_reply);
                 client.update_response(&i.token).embeds(Some(&[out])).await?;
             }
             _ => {}
@@ -341,7 +348,7 @@ impl Bot {
         Ok(())
     }
 
-    async fn login(&self, ctx: &Ctx, token: &str) -> Result<Embed> {
+    async fn login(&self, ctx: &Ctx, token: &str, interaction_token: &str) -> Result<Embed> {
         // A running index would write the old account's data over the new one.
         if let Some(old) = self.db().user_by_discord(ctx.discord_id).await?
             && self.ingest.is_busy(old.id)
@@ -349,22 +356,53 @@ impl Bot {
             return Ok(reply("Your history is still downloading. Try again when it finishes."));
         }
         let Some(lb_name) = self.ingest.lb.validate_token(token).await? else {
-            return Ok(reply("Invalid token. Paste the **User token** from listenbrainz.org/settings."));
+            return Ok(reply(format!("Invalid token. Paste the **User token** from {SETTINGS}.")));
         };
         let user_id = self.db().upsert_user(ctx.discord_id, &lb_name, token).await?;
         if let Some(g) = ctx.guild {
             self.db().add_members(g, &[(ctx.discord_id, ctx.name.clone())]).await?;
         }
         // Each /login downloads the full history once; the token is deleted when that finishes.
-        self.ingest.spawn_index(user_id);
+        self.notify_when_indexed(user_id, ctx.discord_id, interaction_token.to_owned());
         let mut text = format!(
-            "Connected as **{lb_name}**. Your full history is downloading as a ListenBrainz export. Large accounts can take a few minutes. Your token is deleted when it finishes."
+            "Connected as **{lb_name}**. Your full history is downloading as a ListenBrainz export. Large accounts can take a few minutes. You'll get a message when it's done and your token has been deleted."
         );
         if ctx.guild.is_none() {
             // Users who connect in a DM join server lists with their first command there, or via /refreshmembers.
             text.push_str(" To show up in a server's WhoKnows, use any command in that server.");
         }
         Ok(reply(text))
+    }
+
+    /// Indexes in the background and tells the user when it's done: as a reply to their /login while Discord
+    /// still accepts one (15 minutes), else in a DM. The raw Discord id lives only in this task, never in the database.
+    fn notify_when_indexed(&self, user_id: i32, discord_id: i64, interaction_token: String) {
+        let (ingest, http, app_id) = (self.ingest.clone(), self.http.clone(), self.app_id);
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let text = match ingest.index_now(user_id).await {
+                Ok(Some(n)) => format!(
+                    "Your history is downloaded: **{n}** listens. Your ListenBrainz token has been deleted from the bot; from now on it only reads your public listens."
+                ),
+                Ok(None) => return,
+                Err(_) => "Downloading your history failed. Run `/login` again to retry.".to_owned(),
+            };
+            let sent = if started.elapsed() < std::time::Duration::from_secs(14 * 60) {
+                let client = http.interaction(app_id);
+                let embeds = [reply(text)];
+                client.create_followup(&interaction_token).flags(MessageFlags::EPHEMERAL).embeds(&embeds).await.map(drop).map_err(anyhow::Error::from)
+            } else {
+                async {
+                    let channel = http.create_private_channel(Id::new(discord_id as u64)).await?.model().await?;
+                    http.create_message(channel.id).embeds(&[reply(text)]).await?;
+                    anyhow::Ok(())
+                }
+                .await
+            };
+            if let Err(e) = sent {
+                tracing::warn!(user_id, error = ?e, "couldn't tell the user their index finished");
+            }
+        });
     }
 
     async fn featured_block(&self, ctx: &Ctx) -> Result<Embed> {
@@ -389,7 +427,7 @@ impl Bot {
         }
 
         let Some(user) = self.db().user_by_discord(ctx.discord_id).await? else {
-            return Ok(reply("Connect your ListenBrainz account with `/login` first."));
+            return Ok(reply(format!("Connect your ListenBrainz account with `/login` first. You'll need your **User token** from {SETTINGS}.")));
         };
         if let Some(g) = ctx.guild {
             self.db().add_members(g, &[(ctx.discord_id, ctx.name.clone())]).await?;
