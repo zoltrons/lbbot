@@ -541,7 +541,8 @@ impl Bot {
             .iter()
             .enumerate()
             .map(|(n, r)| {
-                let rank = if n == 0 && crown { "👑".to_owned() } else { format!("{}.", n + 1) };
+                // `1.` at the start of a line is a Markdown list item, which Discord draws as its own block.
+                let rank = if n == 0 && crown { "👑".to_owned() } else { format!("{}\\.", n + 1) };
                 row(rank, &r.name, &r.lb_name, r.plays, r.discord_hash == user.discord_hash)
             })
             .collect();
