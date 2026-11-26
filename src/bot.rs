@@ -481,7 +481,11 @@ impl Bot {
                     tracing::warn!(error = ?e, "update during wk failed");
                 }
                 let Some((id, title)) = self.db().find(kind, &artist, name.as_deref()).await? else {
-                    return Ok(reply(format!("No one on the bot has listened to **{}**.", name.unwrap_or(artist))));
+                    let mut text = format!("No one on the bot has listened to **{}**.", escape(&name.unwrap_or(artist)));
+                    if let Some(note) = indexing_note {
+                        text = format!("{text} {note}");
+                    }
+                    return Ok(reply(text));
                 };
                 let guild = if global { None } else { ctx.guild };
                 let rows = self.db().who_knows(kind, id, guild).await?;
