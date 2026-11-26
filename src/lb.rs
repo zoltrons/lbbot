@@ -103,13 +103,13 @@ pub fn album_key(album: &str) -> String {
 }
 
 /// Removes `(...)`/`[...]` groups and a trailing ` - ...` suffix when the inside starts with `prefixes` or contains `words`.
-/// A tag mentioning live/remix/acoustic/demo is never removed, so "Song - Live / Remastered" stays apart from the studio take.
+/// A `words` tag mentioning live/remix/acoustic/demo is never removed, so "Song - Live / Remastered" stays apart from the studio take.
 fn strip_tags(name: &str, prefixes: &[&str], words: &[&str]) -> String {
     const KEEP: [&str; 4] = ["live", "remix", "acoustic", "demo"];
     let drop = |inner: &str| {
         let l = inner.trim().to_lowercase();
-        !KEEP.iter().any(|k| l.contains(k))
-            && (prefixes.iter().any(|p| l.starts_with(p)) || words.iter().any(|w| l.contains(w)))
+        // A feat. group only names artists, so the guard applies to `words` alone ("feat. Clive" holds "live").
+        prefixes.iter().any(|p| l.starts_with(p)) || (!KEEP.iter().any(|k| l.contains(k)) && words.iter().any(|w| l.contains(w)))
     };
     let name = &apostrophes(name);
     let mut out = String::with_capacity(name.len());
@@ -279,6 +279,10 @@ impl Lb {
         for attempt in 0..4u32 {
             let resp = self.send(req.try_clone().context("request not cloneable")?, prio).await?;
             let status = resp.status();
+            // LB answers 204 with an empty body when it has no stats for the user yet.
+            if status == StatusCode::NO_CONTENT {
+                return Ok(Value::Null);
+            }
             let text = resp.text().await?;
             match serde_json::from_str::<Value>(&text) {
                 Ok(body) if status.is_success() => return Ok(body),
@@ -293,6 +297,35 @@ impl Lb {
             }
         }
         unreachable!("last attempt returns")
+    }
+
+    /// Albums with a cover for the bot's avatar, best first.
+    /// `range` is an LB stats range (week, month, all_time); `None` = the user's 50 newest listens.
+    pub async fn featured_albums(&self, user: &str, range: Option<&str>) -> Result<Vec<FeaturedAlbum>> {
+        let req = match range {
+            None => self.req_query(Method::GET, &["1", "user", user, "listens"], &[("count", 50)], None),
+            Some(r) => {
+                let mut url = self.url(&["1", "stats", "user", user, "release-groups"], &[("count", 50)]);
+                url.query_pairs_mut().append_pair("range", r);
+                self.http.get(url)
+            }
+        };
+        Ok(featured_candidates(&self.json(req, Prio::Background).await?))
+    }
+
+    /// Downloads an image (at most 8 MB) and returns it as a `data:` URI, the form Discord takes for avatars.
+    pub async fn image_data_uri(&self, url: &str) -> Result<String> {
+        let resp = self.http.get(url).send().await?.error_for_status()?;
+        let kind = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+        if !matches!(kind.as_str(), "image/jpeg" | "image/png") {
+            bail!("cover {url} has content-type {kind:?}");
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() > 8 << 20 {
+            bail!("cover {url} is {} bytes", bytes.len());
+        }
+        use base64::Engine;
+        Ok(format!("data:{kind};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
     }
 
     /// Returns the owner's username when the token is valid.
@@ -538,6 +571,35 @@ pub fn cover_url(v: &Value) -> Option<String> {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct FeaturedAlbum {
+    /// One album has many releases, each with its own cover URL; repeats are checked by release group.
+    pub release_group: String,
+    pub cover: String,
+    /// "Album - Artist", for the log.
+    pub label: String,
+}
+
+/// Candidates from a listens page or a release-group stats page; entries without a cover or release group are skipped.
+fn featured_candidates(body: &Value) -> Vec<FeaturedAlbum> {
+    // Only the cover LB itself picked (caa_id); `release_mbid` alone may have no front image.
+    let album = |v: &Value, album: &Value, artist: &Value| {
+        v["caa_id"].as_i64()?;
+        Some(FeaturedAlbum {
+            release_group: v["release_group_mbid"].as_str()?.to_owned(),
+            cover: cover_url(v)?,
+            label: format!("{} - {}", album.as_str()?, artist.as_str()?),
+        })
+    };
+    let listens = body["payload"]["listens"].as_array().into_iter().flatten().filter_map(|l| {
+        let m = &l["track_metadata"];
+        album(&m["mbid_mapping"], &m["release_name"], &m["artist_name"])
+    });
+    let stats = body["payload"]["release_groups"].as_array().into_iter().flatten()
+        .filter_map(|g| album(g, &g["release_group_name"], &g["artist_name"]));
+    listens.chain(stats).collect()
+}
+
 /// ListenBrainz entity page: `artist`/mbid, `album`/release-group mbid, `track`/recording mbid.
 pub fn page_url(kind: &str, mbid: &str) -> String {
     let mut url = Url::parse("https://listenbrainz.org").expect("static url");
@@ -604,6 +666,20 @@ mod tests {
     }
 
     /// Hits the real API: `cargo test -- --ignored live_api`
+    #[tokio::test]
+    #[ignore]
+    async fn live_featured() {
+        let lb = super::Lb::new();
+        for range in [None, Some("week"), Some("all_time")] {
+            let albums = lb.featured_albums("rob", range).await.unwrap();
+            println!("{range:?}: {} albums, first {:?}", albums.len(), albums.first());
+        }
+        let albums = lb.featured_albums("rob", Some("all_time")).await.unwrap();
+        let uri = lb.image_data_uri(&albums[0].cover).await.unwrap();
+        assert!(uri.starts_with("data:image/"), "{}", &uri[..40]);
+        println!("data uri {} KB", uri.len() / 1024);
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_api() {
@@ -737,6 +813,27 @@ mod tests {
     }
 
     #[test]
+    fn featured_candidates_need_a_cover() {
+        let listens = serde_json::json!({"payload": {"listens": [
+            {"track_metadata": {"artist_name": "A", "release_name": "X", "mbid_mapping": {"caa_id": 7, "caa_release_mbid": "r1", "release_group_mbid": "g1"}}},
+            {"track_metadata": {"artist_name": "A", "release_name": "X", "mbid_mapping": {"caa_id": 7, "caa_release_mbid": "r1"}}},
+            {"track_metadata": {"artist_name": "B", "release_name": "Y", "mbid_mapping": {"release_mbid": "r2"}}},
+            {"track_metadata": {"artist_name": "C", "track_name": "Z"}},
+        ]}});
+        let album = |g: &str, r: &str, id: i64, label: &str| super::FeaturedAlbum {
+            release_group: g.into(),
+            cover: format!("https://coverartarchive.org/release/{r}/{id}-1200.jpg"),
+            label: label.into(),
+        };
+        assert_eq!(super::featured_candidates(&listens), [album("g1", "r1", 7, "X - A")]);
+        let stats = serde_json::json!({"payload": {"release_groups": [
+            {"artist_name": "P", "release_group_name": "Q", "caa_id": 9, "caa_release_mbid": "r3", "release_group_mbid": "g3"},
+        ]}});
+        assert_eq!(super::featured_candidates(&stats), [album("g3", "r3", 9, "Q - P")]);
+        assert!(super::featured_candidates(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
     fn review_cases() {
         // MusicBrainz writes ’, clients write '.
         assert_eq!(super::title_key("Don’t Stop Me Now"), super::title_key("Don't Stop Me Now"));
@@ -746,5 +843,7 @@ mod tests {
         assert_eq!(super::title_key("Song (Feathers)"), "Song (Feathers)");
         assert_eq!(super::title_key("Song (feat. A (B))"), "Song");
         assert_eq!(super::title_key("Song (feat. A (B)) (Live)"), "Song (Live)");
+        assert_eq!(super::title_key("Song (feat. Clive Davis)"), "Song");
+        assert_eq!(super::title_key("Song (with Lil Demon)"), "Song");
     }
 }

@@ -87,6 +87,27 @@ impl Db {
         Ok(())
     }
 
+    /// A random user for the bot's avatar: indexed, not private, listened in the last 30 days.
+    /// Also returns a random number 0..4 for the pick mode.
+    pub async fn featured_user(&self) -> Result<Option<(String, i32)>> {
+        Ok(sqlx::query_as(
+            "SELECT lb_name, floor(random() * 4)::int FROM users
+             WHERE indexed AND NOT private AND last_ts > extract(epoch FROM now())::bigint - 30 * 86400
+             ORDER BY random() LIMIT 1",
+        )
+        .fetch_optional(&self.0).await?)
+    }
+
+    pub async fn featured_blocked(&self) -> Result<HashSet<String>> {
+        let rows: Vec<String> = sqlx::query_scalar("SELECT release_group FROM featured_block").fetch_all(&self.0).await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    pub async fn block_featured(&self, release_group: &str) -> Result<()> {
+        sqlx::query("INSERT INTO featured_block VALUES ($1) ON CONFLICT DO NOTHING").bind(release_group).execute(&self.0).await?;
+        Ok(())
+    }
+
     pub async fn toggle_private(&self, id: i32) -> Result<bool> {
         Ok(sqlx::query_scalar("UPDATE users SET private = NOT private WHERE id = $1 RETURNING private")
             .bind(id).fetch_one(&self.0).await?)

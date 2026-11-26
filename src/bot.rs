@@ -48,6 +48,9 @@ pub struct Bot {
     pub guild_names: RwLock<HashMap<i64, String>>,
     /// Card image/tag cache, so popular artists don't fill the MusicBrainz queue.
     pub art_cache: std::sync::Mutex<HashMap<ArtKey, (std::time::Instant, Art)>>,
+    pub featured: Arc<crate::featured::Featured>,
+    /// Discord id of the application owner, for owner-only commands.
+    pub owner: Option<i64>,
 }
 
 /// (kind, lowercase artist, lowercase album/track)
@@ -73,6 +76,8 @@ enum Cmd {
     Remove { confirm: bool },
     Help,
     RefreshMembers,
+    /// Owner only, text only: ban the current avatar's album and pick another one.
+    FeaturedBlock,
 }
 
 struct Ctx {
@@ -104,6 +109,7 @@ fn parse_text(word: &str, rest: &str) -> Option<Cmd> {
         "remove" | "delete" | "removedata" | "deletedata" | "logout" => Some(Cmd::Remove { confirm: rest == "confirm" }),
         "help" => Some(Cmd::Help),
         "refreshmembers" => Some(Cmd::RefreshMembers),
+        "featured" if rest == "block" => Some(Cmd::FeaturedBlock),
         _ => None,
     }
 }
@@ -244,6 +250,7 @@ impl Bot {
             Cmd::Login => reply("Use `/login` so your token stays private."),
             Cmd::Prefix(_) => reply(format!("Prefix: `{prefix}`. Use `/prefix` to change it (needs Manage Server).")),
             Cmd::RefreshMembers => reply("Use `/refreshmembers` to reload the member list (needs Manage Server)."),
+            Cmd::FeaturedBlock => self.featured_block(&ctx).await.unwrap_or_else(error_reply),
             cmd => self.run(&ctx, cmd).await.unwrap_or_else(error_reply),
         };
         tracing::info!(title = ?out.title, desc = ?out.description.as_deref().map(|d| d.chars().take(120).collect::<String>()), "reply");
@@ -347,6 +354,13 @@ impl Bot {
             text.push_str(" To show up in a server's WhoKnows, use any command in that server.");
         }
         Ok(reply(text))
+    }
+
+    async fn featured_block(&self, ctx: &Ctx) -> Result<Embed> {
+        if self.owner != Some(ctx.discord_id) {
+            return Ok(reply("Only the bot owner can do this."));
+        }
+        Ok(reply(escape(&self.featured.block(&self.http, &self.ingest).await?)))
     }
 
     async fn run(&self, ctx: &Ctx, cmd: Cmd) -> Result<Embed> {
@@ -485,7 +499,7 @@ impl Bot {
                 self.db().delete_user(user.id).await?;
                 Ok(reply("Your account and all your data were deleted."))
             }
-            Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers => unreachable!("handled above"),
+            Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock => unreachable!("handled above"),
         }
     }
 
@@ -810,6 +824,8 @@ mod tests {
         assert_eq!(parse_text("remove", "confirm"), Some(Cmd::Remove { confirm: true }));
         assert_eq!(parse_text("remove", ""), Some(Cmd::Remove { confirm: false }));
         assert_eq!(parse_text("hello", ""), None);
+        assert_eq!(parse_text("featured", "block"), Some(Cmd::FeaturedBlock));
+        assert_eq!(parse_text("featured", ""), None);
     }
 
     #[test]

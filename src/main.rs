@@ -1,6 +1,7 @@
 mod bot;
 mod crypto;
 mod db;
+mod featured;
 mod history;
 mod ingest;
 mod lb;
@@ -29,8 +30,14 @@ async fn main() -> Result<()> {
     }
 
     let http = Arc::new(twilight_http::Client::new(token.clone()));
-    let app_id = http.current_user_application().await?.model().await?.id;
+    let app = http.current_user_application().await?.model().await?;
+    let app_id = app.id;
+    // For a team app, `owner` is a placeholder user; the team owner is the real one.
+    let owner = app.team.map(|t| t.owner_user_id).or(app.owner.map(|u| u.id)).map(|id| id.get() as i64);
     http.interaction(app_id).set_global_commands(&bot::slash_commands()).await?;
+
+    let featured = Arc::new(featured::Featured::default());
+    tokio::spawn(featured::run(featured.clone(), http.clone(), ingest.clone()));
 
     let bot = Arc::new(bot::Bot {
         http: http.clone(),
@@ -39,6 +46,8 @@ async fn main() -> Result<()> {
         prefixes: std::sync::RwLock::new(db.prefixes().await?.into_iter().collect()),
         guild_names: Default::default(),
         art_cache: Default::default(),
+        featured,
+        owner,
     });
 
     let intents = Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;

@@ -70,6 +70,12 @@ MusicBrainz allows one request per second, so its requests wait in a separate qu
 
 Cover images, artist photos and tags on the cards come from LB's mapping, MusicBrainz, the Cover Art Archive, and Apple Music or Tidal artist pages. Results are cached in memory for 24 hours, up to 10,000 entries. A lookup that failed halfway isn't cached, so it gets retried on the next command.
 
+## The bot's avatar
+
+Like fmbot, the bot changes its profile picture once an hour, on the hour (`src/featured.rs`). It picks a random user who is indexed, hasn't turned on `/privacy`, and has listened in the last 30 days. Then it picks one of four sources at random: that user's 50 newest listens, or their top albums of the week, the month or all time from LB's stats. The first album with a Cover Art Archive cover that hasn't been used in the last 28 days and isn't blocked becomes the new avatar. Albums are compared by MusicBrainz release group, since one album has many releases and each has its own cover. If a user has nothing usable, the bot tries another user, up to five times, then waits for the next hour.
+
+The bot doesn't post who or what was featured; it only writes it to the log. The list of recently used covers lives in memory, so a restart can bring an album back early. Nothing detects explicit covers automatically. When one comes up, the bot owner types `.featured block`: the bot stores the album's release group in `featured_block`, never uses it again, and picks a new avatar right away. If no new album can be set (none found, or Discord refuses the change), it resets the avatar to Discord's default, so the blocked cover doesn't stay up. The reply says which of the two happened. fmbot also skips albums with few listeners; brainzbot doesn't.
+
 ## Deleting data
 
 `/remove confirm:True` deletes the user's account, history, counter rows and server memberships. It refuses while an index for that user is still running, because the index would write the data back.
