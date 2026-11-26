@@ -44,6 +44,10 @@ async fn main() -> Result<()> {
     // For a team app, `owner` is a placeholder user; the team owner is the real one.
     let owner = app.team.map(|t| t.owner_user_id).or(app.owner.map(|u| u.id)).map(|id| id.get() as i64);
     http.interaction(app_id).set_global_commands(&bot::slash_commands()).await?;
+    // Kept in the code so every deployment shows the same profile text; edits in the Developer Portal are overwritten.
+    if let Err(e) = http.update_current_user_application().description(DESCRIPTION).await {
+        tracing::warn!(error = ?e, "couldn't set the app description");
+    }
 
     let featured = Arc::new(featured::Featured::default());
     tokio::spawn(featured::run(featured.clone(), http.clone(), ingest.clone()));
@@ -63,7 +67,8 @@ async fn main() -> Result<()> {
     let intents = Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
     let total = http.gateway().authed().await?.model().await?.shards;
     let config = Config::new(token, intents);
-    let shards = (0..total).map(|i| Shard::with_config(ShardId::new(i, total), config.clone()));
+    let shards: Vec<Shard> = (0..total).map(|i| Shard::with_config(ShardId::new(i, total), config.clone())).collect();
+    tokio::spawn(presence_loop(shards.iter().map(Shard::sender).collect(), bot.clone()));
     let mut tasks = tokio::task::JoinSet::new();
     for shard in shards {
         tasks.spawn(run_shard(shard, bot.clone()));
@@ -71,6 +76,49 @@ async fn main() -> Result<()> {
     tracing::info!(shards = tasks.len(), "running");
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+const DESCRIPTION: &str = "Shows what you're listening to and who in your server listens to the same artist, album or track, from your ListenBrainz history. Start with /login.\n\nOpen source: https://github.com/zoltrons/lbbot";
+
+/// fmbot-style status: ".fm — lbbot — N servers", refreshed every 10 minutes on every shard.
+async fn presence_loop(senders: Vec<twilight_gateway::MessageSender>, bot: Arc<bot::Bot>) {
+    use twilight_model::gateway::{
+        payload::outgoing::UpdatePresence,
+        presence::{Activity, ActivityType, Status},
+    };
+    // Let the shards connect and the GUILD_CREATE events arrive before the first count.
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    loop {
+        let servers = bot.guild_names.read().unwrap().len();
+        let activity = Activity {
+            application_id: None,
+            assets: None,
+            buttons: Vec::new(),
+            created_at: None,
+            details: None,
+            details_url: None,
+            emoji: None,
+            flags: None,
+            id: None,
+            instance: None,
+            kind: ActivityType::Custom,
+            name: "Custom Status".into(),
+            party: None,
+            secrets: None,
+            state: Some(format!(".fm — lbbot — {servers} servers")),
+            state_url: None,
+            timestamps: None,
+            url: None,
+            status_display_type: None,
+        };
+        match UpdatePresence::new(vec![activity], false, None, Status::Online) {
+            Ok(presence) => senders.iter().for_each(|s| {
+                let _ = s.command(&presence);
+            }),
+            Err(e) => tracing::warn!(error = ?e, "bad presence"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    }
 }
 
 async fn run_shard(mut shard: Shard, bot: Arc<bot::Bot>) {
