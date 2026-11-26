@@ -190,9 +190,20 @@ impl Bot {
                     self.guild_names.write().unwrap().insert(id.get() as i64, g.name.clone());
                 }
                 // Rebuild the member list; Discord sends it in MEMBER_CHUNK parts.
-                self.db().clear_guild(id.get() as i64).await.and_then(|()| {
+                let prefix = self.db().prefix(id.get() as i64).await;
+                if let Ok(Some(p)) = &prefix {
+                    self.prefixes.write().unwrap().insert(id.get() as i64, p.clone());
+                }
+                prefix.and(self.db().clear_guild(id.get() as i64).await).and_then(|()| {
                     Ok(sender.command(&RequestGuildMembers::builder(id).query("", None))?)
                 })
+            }
+            // `unavailable` means an outage; otherwise the bot was removed and keeps nothing about the server.
+            Event::GuildDelete(g) if !g.unavailable.unwrap_or(false) => {
+                let id = g.id.get() as i64;
+                self.prefixes.write().unwrap().remove(&id);
+                self.guild_names.write().unwrap().remove(&id);
+                self.db().forget_guild(id).await
             }
             Event::GuildUpdate(g) => {
                 self.guild_names.write().unwrap().insert(g.id.get() as i64, g.name.clone());
@@ -237,7 +248,10 @@ impl Bot {
         let Some(body) = msg.content.strip_prefix(prefix.as_str()) else { return Ok(()) };
         let (word, rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
         let Some(cmd) = parse_text(&word.to_lowercase(), rest.trim()) else { return Ok(()) };
-        tracing::info!(user = msg.author.id.get(), ?cmd, "text command");
+        // No command text or ids in logs: the command name and a keyed hash are enough to follow a problem.
+        let name = format!("{cmd:?}");
+        let name = name.split([' ', '(', '{']).next().unwrap_or_default();
+        tracing::info!(user = %self.db().1.log_id(msg.author.id.get() as i64), cmd = name, "text command");
 
         let ctx = Ctx {
             discord_id: msg.author.id.get() as i64,
@@ -253,7 +267,6 @@ impl Bot {
             Cmd::FeaturedBlock => self.featured_block(&ctx).await.unwrap_or_else(error_reply),
             cmd => self.run(&ctx, cmd).await.unwrap_or_else(error_reply),
         };
-        tracing::info!(title = ?out.title, desc = ?out.description.as_deref().map(|d| d.chars().take(120).collect::<String>()), "reply");
         self.http.create_message(msg.channel_id).embeds(&[out]).reply(msg.id).await?;
         Ok(())
     }
@@ -338,17 +351,15 @@ impl Bot {
         let Some(lb_name) = self.ingest.lb.validate_token(token).await? else {
             return Ok(reply("Invalid token. Paste the **User token** from listenbrainz.org/settings."));
         };
-        let enc = self.ingest.crypto.encrypt(token);
-        let user_id = self.db().upsert_user(ctx.discord_id, &lb_name, &enc).await?;
+        let user_id = self.db().upsert_user(ctx.discord_id, &lb_name, token).await?;
         if let Some(g) = ctx.guild {
             self.db().add_members(g, &[(ctx.discord_id, ctx.name.clone())]).await?;
         }
-        let user = self.db().user(user_id).await?;
-        let mut text = format!("Connected as **{lb_name}**.");
-        if !user.indexed {
-            self.ingest.spawn_index(user_id);
-            text.push_str(" Your full history is downloading as a ListenBrainz export. Large accounts can take a few minutes.");
-        }
+        // Each /login downloads the full history once; the token is deleted when that finishes.
+        self.ingest.spawn_index(user_id);
+        let mut text = format!(
+            "Connected as **{lb_name}**. Your full history is downloading as a ListenBrainz export. Large accounts can take a few minutes. Your token is deleted when it finishes."
+        );
         if ctx.guild.is_none() {
             // Users who connect in a DM join server lists with their first command there, or via /refreshmembers.
             text.push_str(" To show up in a server's WhoKnows, use any command in that server.");
@@ -391,12 +402,17 @@ impl Bot {
                     return Ok(reply("Your history is downloading now. It will be up to date when it finishes."));
                 }
                 if !user.indexed {
-                    // The previous index stopped on an error.
+                    // The previous index stopped on an error; its token is kept until an index finishes.
+                    if user.lb_token.is_none() {
+                        return Ok(reply("Run `/login` again to download your history."));
+                    }
                     self.ingest.spawn_index(user.id);
                     return Ok(reply("Restarted the download of your history."));
                 }
                 Ok(match self.ingest.sync(&user).await? {
-                    (_, true) => reply("Your history on ListenBrainz changed (an import or a deletion). Downloading it again."),
+                    (n, true) => reply(format!(
+                        "Updated: {n} new listens. Your older history on ListenBrainz changed (an import or a deletion), so some counts are out of date. Run `/login` again to download it fresh."
+                    )),
                     (n, false) => reply(format!("Updated: {n} new listens.")),
                 })
             }
@@ -412,7 +428,7 @@ impl Bot {
                         None => 0,
                     })
                 };
-                let art = self.art(&user, Kind::Track, &t.artist_name, Some(&t.track_name), t.release_name.as_deref(), mapping);
+                let art = self.art(Kind::Track, &t.artist_name, Some(&t.track_name), t.release_name.as_deref(), mapping);
                 let (artist_plays, art) = tokio::join!(plays, art);
                 let artist_plays = artist_plays?;
                 let track = match &art.url {
@@ -474,7 +490,7 @@ impl Bot {
                     Kind::Album => (now.0, name.as_deref()),
                     Kind::Track => (name.clone(), None),
                 };
-                let art = self.art(&user, kind, &artist, track.as_deref(), album, now.1);
+                let art = self.art(kind, &artist, track.as_deref(), album, now.1);
                 let own = self.db().plays(kind, id, user.id);
                 let (mut art, own) = tokio::join!(art, own);
                 let tags = art.tags.take();
@@ -526,10 +542,10 @@ impl Bot {
             .enumerate()
             .map(|(n, r)| {
                 let rank = if n == 0 && crown { "👑".to_owned() } else { format!("{}.", n + 1) };
-                row(rank, &r.name, &r.lb_name, r.plays, r.discord_id == user.discord_id)
+                row(rank, &r.name, &r.lb_name, r.plays, r.discord_hash == user.discord_hash)
             })
             .collect();
-        if own > 0 && !rows.iter().any(|r| r.discord_id == user.discord_id) {
+        if own > 0 && !rows.iter().any(|r| r.discord_hash == user.discord_hash) {
             // Rows use the server nickname in a server and the LB name globally.
             let name = if global { &user.lb_name } else { &ctx.name };
             lines.push(row("…".into(), name, &user.lb_name, own, true));
@@ -562,7 +578,7 @@ impl Bot {
     }
 
     /// Card image and tags, from the cache or `fetch_art`. An error doesn't break the card and isn't cached.
-    async fn art(&self, user: &crate::db::User, kind: Kind, artist: &str, track: Option<&str>, album: Option<&str>, mapping: Value) -> Art {
+    async fn art(&self, kind: Kind, artist: &str, track: Option<&str>, album: Option<&str>, mapping: Value) -> Art {
         let name = match kind {
             Kind::Artist => "",
             Kind::Album => album.unwrap_or_default(),
@@ -572,7 +588,7 @@ impl Bot {
         let cached = cache_get(&self.art_cache.lock().unwrap(), &key);
         let mut art = match cached {
             Some(art) => art,
-            None => self.fetch_art_cached(user, kind, artist, track, album, mapping, key, name_key).await,
+            None => self.fetch_art_cached(kind, artist, track, album, mapping, key, name_key).await,
         };
         // Without an id the title still links somewhere: a ListenBrainz search.
         if art.url.is_none() {
@@ -589,7 +605,6 @@ impl Bot {
     #[allow(clippy::too_many_arguments)]
     async fn fetch_art_cached(
         &self,
-        user: &crate::db::User,
         kind: Kind,
         artist: &str,
         track: Option<&str>,
@@ -598,7 +613,7 @@ impl Bot {
         key: ArtKey,
         name_key: ArtKey,
     ) -> Art {
-        match self.fetch_art(user, kind, artist, track, album, mapping).await {
+        match self.fetch_art(kind, artist, track, album, mapping).await {
             Ok((art, complete)) => {
                 if complete {
                     let mut cache = self.art_cache.lock().unwrap();
@@ -622,7 +637,6 @@ impl Bot {
     /// When the playing track's mapping has the right artist/album id, it is used before a name search.
     async fn fetch_art(
         &self,
-        user: &crate::db::User,
         kind: Kind,
         artist: &str,
         track: Option<&str>,
@@ -630,14 +644,13 @@ impl Bot {
         mut mapping: Value,
     ) -> Result<(Art, bool)> {
         let lb = &self.ingest.lb;
-        let token = self.ingest.crypto.decrypt(&user.lb_token)?;
         Ok(match kind {
             Kind::Artist => {
                 // Without a mapping (playing-now) it comes from a lookup: the first id is the main artist ("A feat. B" → A).
                 if mapping["artist_mbids"].get(0).is_none()
                     && let Some(t) = track
                 {
-                    match lb.lookup(&token, artist, t, album).await {
+                    match lb.lookup(artist, t, album).await {
                         Ok(m) => mapping = m,
                         Err(e) => tracing::warn!(error = ?e, "artist lookup failed"),
                     }
@@ -686,7 +699,7 @@ impl Bot {
                 let mbid = known.or(a.as_ref().and_then(|a| a["id"].as_str()));
                 let cover = match (photo, mbid) {
                     (Some(photo), _) => Some(photo),
-                    (None, Some(mbid)) => lb.artist_cover(&token, mbid).await.unwrap_or_else(|e| {
+                    (None, Some(mbid)) => lb.artist_cover(mbid).await.unwrap_or_else(|e| {
                         tracing::warn!(error = ?e, "artist cover failed");
                         complete = false;
                         None
@@ -718,12 +731,12 @@ impl Bot {
             Kind::Track => {
                 if mapping.get("recording_mbid").is_none() {
                     let Some(t) = track else { return Ok((Art::default(), true)) };
-                    mapping = lb.lookup(&token, artist, t, album).await?;
+                    mapping = lb.lookup(artist, t, album).await?;
                 }
                 let Some(rec) = mapping["recording_mbid"].as_str() else { return Ok((Art::default(), true)) };
                 let url = Some(crate::lb::page_url("track", rec));
                 // The cover comes from the same release as the track page; if that request fails, use the mapping's and don't cache.
-                match lb.recording_release(&token, rec).await {
+                match lb.recording_release(rec).await {
                     // For a merged (old) id the service returns nothing while the page redirects: use the mapping's cover then.
                     Ok(release) => (Art { cover: crate::lb::cover_url(&release).or_else(|| crate::lb::cover_url(&mapping)), tags: None, url }, true),
                     Err(e) => {

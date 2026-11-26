@@ -24,7 +24,7 @@ The default prefix is `.`, and every command also exists as a slash command.
 
 Without an argument, `.w`, `.wa` and `.wt` use the track you are playing. With one, they take `Artist` or `Artist - Name`.
 
-After you log in, the bot downloads your full history from ListenBrainz as an export. Large accounts can take a few minutes.
+After you log in, the bot downloads your full history from ListenBrainz as an export, which can take a few minutes for large accounts, and then deletes your token. From then on it fetches only new listens. If you import or delete older listens on ListenBrainz, `.update` tells you, and `/login` downloads everything again.
 
 ## Running it
 
@@ -37,6 +37,8 @@ cp .env.example .env   # fill in the values; for TOKEN_KEY run: openssl rand -ba
 docker compose up -d
 ```
 
+`LB_TOKEN` is your own ListenBrainz user token. ListenBrainz requires a token for the metadata lookups behind the cover images, and the bot uses yours instead of keeping users' tokens.
+
 Keep `TOKEN_KEY` safe. If it is lost, the stored ListenBrainz tokens can't be decrypted and every user has to log in again.
 
 ## Development
@@ -45,7 +47,7 @@ You need Rust and a Postgres database. On macOS, `scripts/dev-db.sh` starts one 
 
 ```sh
 scripts/dev-db.sh
-DISCORD_TOKEN=... TOKEN_KEY=... DATABASE_URL=... cargo run
+DISCORD_TOKEN=... LB_TOKEN=... TOKEN_KEY=... DATABASE_URL=... cargo run
 TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:55432/postgres cargo test
 ```
 

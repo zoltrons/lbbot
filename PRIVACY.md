@@ -8,8 +8,9 @@ Everything is kept in one PostgreSQL database.
 
 When you run `/login`:
 
-- Your Discord user ID.
-- Your ListenBrainz username and user token. The token is encrypted before it is written (see [SECURITY.md](SECURITY.md)). The bot needs it to download your history as an export and to look up track metadata on ListenBrainz.
+- A keyed hash of your Discord user ID, never the ID itself. The hash is made with the bot's secret key, so without that key nobody can tell which Discord account a row belongs to.
+- Your ListenBrainz username.
+- Your ListenBrainz user token, encrypted (see [SECURITY.md](SECURITY.md)), only until your history has been downloaded. The bot needs it to request your export, and deletes it as soon as that download is done.
 
 After login, the bot downloads your ListenBrainz history and keeps:
 
@@ -20,7 +21,7 @@ After login, the bot downloads your ListenBrainz history and keeps:
 
 Artist, album and track names go into shared tables that all users point to. Those tables hold names only, with nothing that ties a name to a person.
 
-For each server where the bot sees you, the bot stores the server ID, your Discord user ID and your display name in that server. It only does this for users who have logged in. Other members of the server are never stored. For servers, it stores the custom prefix if one was set.
+For each server where the bot sees you, the bot stores a keyed hash of the server ID, a link to your account, and your display name in that server. It only does this for users who have logged in. Other members of the server are never stored. For servers, it stores the custom prefix if one was set, also under the hashed server ID.
 
 The bot doesn't store messages. It reads a message only to check whether it starts with the prefix and a command name.
 
@@ -40,26 +41,28 @@ Every hour the bot changes its avatar to an album cover from a random user's rec
 
 ## What the bot sends to other services
 
-- ListenBrainz: your username, to read your listens and stats, and your token, to request your export and look up track metadata.
+- ListenBrainz: your username, to read your listens and stats, and your token, only to request your export after `/login`. Track metadata lookups use the bot operator's own token and the names of the tracks, not yours.
 - MusicBrainz, the Cover Art Archive, Apple Music (including the iTunes search) and Tidal: artist, album and track names, to find covers, artist photos and tags. These requests contain no information about you.
 - Discord: the bot's replies and its avatar.
 
 ## Logs
 
-The bot writes logs to standard output, and the person running it decides how long they are kept. A log line for a text command includes your Discord user ID, the command you typed, and the start of the reply, which can include display names and play counts. Background jobs log your internal user number and your ListenBrainz username.
+The bot writes logs to standard output, and the person running it decides how long they are kept. A log line for a text command has the command's name and a short keyed hash of your Discord user ID. It doesn't include what you typed or what the bot replied. Background jobs log your internal user number, and the hourly avatar change logs the chosen user's ListenBrainz username and album, which are public on ListenBrainz.
 
 ## How long data is kept
 
-Your data stays until you delete it. Nothing expires on its own, including for users who stopped using the bot.
+Your data stays until you delete it. Nothing expires on its own, including for users who stopped using the bot. When the bot is removed from a server, it deletes that server's member list and prefix.
 
-Downloaded export files are deleted from disk as soon as they are read. Cover images, photos and tags are cached in memory for up to 24 hours and are gone when the bot restarts.
+Downloaded export files are readable only by the bot's own system account and are deleted as soon as they are read. Cover images, photos and tags are cached in memory for up to 24 hours and are gone when the bot restarts.
 
 ## Deleting your data
 
-Run `/remove confirm:True` (or `.remove confirm`). The bot deletes your account, your token, your listening history, your play counts and your server memberships right away. It refuses while your history is still downloading, because the download would write the data back. Wait for it to finish and try again.
+Run `/remove confirm:True` (or `.remove confirm`). The bot deletes your account, your token if it still has it, your listening history, your play counts and your server memberships right away. It refuses while your history is still downloading, because the download would write the data back. Wait for it to finish and try again.
 
 Logging in with a different ListenBrainz account deletes the history of the previous account.
 
 `/remove` doesn't touch logs. The person running the bot has to remove those.
 
-Revoking or regenerating your token on [listenbrainz.org/settings](https://listenbrainz.org/settings/) stops the bot from using it, even before you run `/remove`.
+Revoking or regenerating your token on [listenbrainz.org/settings](https://listenbrainz.org/settings/) stops it from working anywhere. The bot has already deleted it once your history was downloaded, and after that it only reads your public listens.
+
+To download your history again, for example after importing older listens into ListenBrainz, run `/login` again.

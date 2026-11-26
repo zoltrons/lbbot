@@ -22,6 +22,9 @@ pub struct Lb {
     /// Requests left in the current window, and when the window ends.
     gate: Mutex<(u32, Instant)>,
     commands_waiting: AtomicUsize,
+    /// The operator's own LB token (`LB_TOKEN`), for metadata endpoints that require one. Users' tokens
+    /// are only used for their own export.
+    service_token: String,
     /// MusicBrainz asks for 1 request/s per IP: the earliest time for the next request.
     mb_next: Mutex<Instant>,
 }
@@ -183,11 +186,11 @@ impl Drop for Waiting<'_> {
 }
 
 impl Lb {
-    pub fn new() -> Self {
-        Self::with_base(API)
+    pub fn new(service_token: String) -> Self {
+        Self::with_base(API, service_token)
     }
 
-    fn with_base(base: &str) -> Self {
+    fn with_base(base: &str, service_token: String) -> Self {
         let http = reqwest::Client::builder()
             // MusicBrainz asks for a contact address in the User-Agent.
             .user_agent(concat!("lbbot/", env!("CARGO_PKG_VERSION"), " ( https://github.com/zoltrons/lbbot )"))
@@ -195,7 +198,7 @@ impl Lb {
             .build()
             .expect("reqwest client");
         let base = Url::parse(base).expect("valid base url");
-        Self { http, base, gate: Mutex::new((1, Instant::now())), commands_waiting: AtomicUsize::new(0), mb_next: Mutex::new(Instant::now()) }
+        Self { http, base, gate: Mutex::new((1, Instant::now())), commands_waiting: AtomicUsize::new(0), service_token, mb_next: Mutex::new(Instant::now()) }
     }
 
     /// Path segments are encoded one by one: MusicBrainz usernames can contain `/`, `?` and `#`.
@@ -367,13 +370,13 @@ impl Lb {
     }
 
     /// MusicBrainz mapping from names (same fields as `mbid_mapping`); an empty object when nothing is found.
-    pub async fn lookup(&self, token: &str, artist: &str, recording: &str, release: Option<&str>) -> Result<Value> {
+    pub async fn lookup(&self, artist: &str, recording: &str, release: Option<&str>) -> Result<Value> {
         let mut url = self.url(&["1", "metadata", "lookup", ""], &[]);
         url.query_pairs_mut().append_pair("artist_name", artist).append_pair("recording_name", recording);
         if let Some(r) = release {
             url.query_pairs_mut().append_pair("release_name", r);
         }
-        let req = self.http.get(url).header("Authorization", format!("Token {token}"));
+        let req = self.http.get(url).header("Authorization", format!("Token {}", self.service_token));
         self.json(req, Prio::Command).await
     }
 
@@ -451,17 +454,17 @@ impl Lb {
 
     /// The release the track's ListenBrainz page shows (including `caa_id` and `caa_release_mbid`). A lookup or the
     /// listen's mapping may pick another release (single, deluxe); taking it from here keeps the cover in line with the page.
-    pub async fn recording_release(&self, token: &str, recording_mbid: &str) -> Result<Value> {
+    pub async fn recording_release(&self, recording_mbid: &str) -> Result<Value> {
         let mut url = self.url(&["1", "metadata", "recording", ""], &[]);
         url.query_pairs_mut().append_pair("recording_mbids", recording_mbid).append_pair("inc", "release");
-        let req = self.http.get(url).header("Authorization", format!("Token {token}"));
+        let req = self.http.get(url).header("Authorization", format!("Token {}", self.service_token));
         let mut body = self.json(req, Prio::Command).await?;
         Ok(body[recording_mbid]["release"].take())
     }
 
     /// Cover of the artist's most popular album; LB/MB have no artist photos.
-    pub async fn artist_cover(&self, token: &str, artist_mbid: &str) -> Result<Option<String>> {
-        let req = self.req(Method::GET, &["1", "popularity", "top-release-groups-for-artist", artist_mbid], Some(token));
+    pub async fn artist_cover(&self, artist_mbid: &str) -> Result<Option<String>> {
+        let req = self.req(Method::GET, &["1", "popularity", "top-release-groups-for-artist", artist_mbid], Some(&self.service_token));
         let body = self.json(req, Prio::Command).await?;
         Ok(body.as_array().into_iter().flatten().find_map(|rg| cover_url(&rg["release_group"])))
     }
@@ -493,7 +496,8 @@ impl Lb {
         if !resp.status().is_success() || !kind.starts_with("application/zip") {
             bail!("export download failed: {} ({kind})", resp.status());
         }
-        let mut file = tokio::fs::File::create(to).await?;
+        // The archive holds the user's whole history: readable only by the bot's own account.
+        let mut file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(to).await?;
         while let Some(chunk) = resp.chunk().await? {
             file.write_all(&chunk).await?;
         }
@@ -651,7 +655,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_art() {
-        let lb = super::Lb::new();
+        let lb = super::Lb::new(std::env::var("LB_TOKEN").unwrap_or_default());
         let a = lb.mb_search("artist", &format!("artist:{}", super::phrase("Twenty One Pilots"))).await.unwrap().expect("artist");
         let mbid = a["id"].as_str().unwrap();
         let info = lb.mb_artist(mbid).await.unwrap();
@@ -669,7 +673,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_featured() {
-        let lb = super::Lb::new();
+        let lb = super::Lb::new(std::env::var("LB_TOKEN").unwrap_or_default());
         for range in [None, Some("week"), Some("all_time")] {
             let albums = lb.featured_albums("rob", range).await.unwrap();
             println!("{range:?}: {} albums, first {:?}", albums.len(), albums.first());
@@ -683,7 +687,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_api() {
-        let lb = super::Lb::new();
+        let lb = super::Lb::new(std::env::var("LB_TOKEN").unwrap_or_default());
         let count = lb.listen_count("rob", super::Prio::Command).await.unwrap();
         let first = lb.listens_after("rob", 0, super::Prio::Command).await.unwrap();
         assert_eq!(first.len(), super::PAGE);
@@ -729,7 +733,7 @@ mod tests {
     async fn retries_bot_check_page() {
         const PAGE_HTML: &str = "<!DOCTYPE html><html><head><title>Verifying your browser</title></head></html>";
         let (addr, server) = fake_lb(&[(200, 10, PAGE_HTML), (200, 10, COUNT)]).await;
-        let lb = super::Lb::with_base(&format!("http://{addr}"));
+        let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
         assert_eq!(lb.listen_count("x", super::Prio::Command).await.unwrap(), 5);
         assert_eq!(server.await.unwrap().len(), 2);
     }
@@ -739,7 +743,7 @@ mod tests {
     async fn error_html_is_not_retried() {
         const ERROR_HTML: &str = "<html><body>Not Found</body></html>";
         let (addr, server) = fake_lb(&[(404, 10, ERROR_HTML)]).await;
-        let lb = super::Lb::with_base(&format!("http://{addr}"));
+        let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
         let started = std::time::Instant::now();
         assert!(lb.listen_count("x", super::Prio::Command).await.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1), "error page was retried");
@@ -750,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn gate_waits_for_window_and_encodes_usernames() {
         let (addr, server) = fake_lb(&[(200, 0, COUNT), (200, 10, COUNT)]).await;
-        let lb = super::Lb::with_base(&format!("http://{addr}"));
+        let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
         assert_eq!(lb.listen_count("a?b/c#d", super::Prio::Command).await.unwrap(), 5);
         assert_eq!(lb.listen_count("x", super::Prio::Background).await.unwrap(), 5);
         let seen = server.await.unwrap();
@@ -763,7 +767,7 @@ mod tests {
     #[tokio::test]
     async fn commands_go_before_background_work() {
         let (addr, server) = fake_lb(&[(200, 0, COUNT), (200, 10, COUNT), (200, 10, COUNT)]).await;
-        let lb = std::sync::Arc::new(super::Lb::with_base(&format!("http://{addr}")));
+        let lb = std::sync::Arc::new(super::Lb::with_base(&format!("http://{addr}"), String::new()));
         lb.listen_count("first", super::Prio::Command).await.unwrap();
         let bg = tokio::spawn({
             let lb = lb.clone();

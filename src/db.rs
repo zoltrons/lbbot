@@ -1,24 +1,30 @@
 //! All SQL lives here. Bulk operations run as one query over unnest arrays.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 
+use crate::crypto::Crypto;
 use crate::history::{self, CHUNK, Entry};
 use crate::lb::Listen;
 
 pub type Tx<'a> = Transaction<'a, Postgres>;
 
+/// Methods take raw Discord ids and hash them here (see `Crypto::id`); the database never sees a raw id.
 #[derive(Clone)]
-pub struct Db(pub PgPool);
+pub struct Db(pub PgPool, pub Arc<Crypto>);
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct User {
     pub id: i32,
-    pub discord_id: i64,
+    pub discord_hash: i64,
     pub lb_name: String,
-    pub lb_token: Vec<u8>,
+    /// Only set between /login and the end of the first index.
+    pub lb_token: Option<Vec<u8>>,
     pub last_ts: i64,
     pub listens: i32,
     pub count_offset: i32,
@@ -29,7 +35,7 @@ pub struct User {
 pub struct WkRow {
     pub name: String,
     pub lb_name: String,
-    pub discord_id: i64,
+    pub discord_hash: i64,
     pub plays: i32,
     pub listeners: i64,
     pub total: i64,
@@ -42,15 +48,56 @@ pub enum Kind {
     Track,
 }
 
-pub async fn connect(url: &str) -> Result<Db> {
+pub async fn connect(url: &str, crypto: Arc<Crypto>) -> Result<Db> {
     let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
     sqlx::migrate!().run(&pool).await?;
-    Ok(Db(pool))
+    let db = Db(pool, crypto);
+    db.migrate_hashed_ids().await?;
+    Ok(db)
 }
 
 impl Db {
+    /// One-time conversion for databases from before migration 0003 (see `hash_ids`), recorded in `app_state`.
+    async fn migrate_hashed_ids(&self) -> Result<()> {
+        let mut tx = self.0.begin().await?;
+        // Two processes starting together must not both convert (and hash the ids twice).
+        sqlx::query("SELECT pg_advisory_xact_lock(7262871)").execute(&mut *tx).await?;
+        let done: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM app_state WHERE name = 'hashed_ids')").fetch_one(&mut *tx).await?;
+        if done {
+            return Ok(());
+        }
+        let (users, guilds) = self.hash_ids(&mut tx).await?;
+        sqlx::query("INSERT INTO app_state VALUES ('hashed_ids')").execute(&mut *tx).await?;
+        tx.commit().await?;
+        tracing::info!(users, guilds, "hashed discord ids");
+        Ok(())
+    }
+
+    /// Raw Discord ids become keyed hashes, and tokens move to the current format, bound to their owner.
+    async fn hash_ids(&self, tx: &mut Tx<'_>) -> Result<(usize, usize)> {
+        let users: Vec<(i32, i64, Option<Vec<u8>>)> = sqlx::query_as("SELECT id, discord_hash, lb_token FROM users").fetch_all(&mut **tx).await?;
+        for (id, discord_id, token) in &users {
+            let hash = self.1.id(*discord_id);
+            let token = token.as_ref().map(|t| self.1.decrypt_legacy(t).map(|t| self.1.encrypt(&t, hash))).transpose()?;
+            sqlx::query("UPDATE users SET discord_hash = $2, lb_token = $3 WHERE id = $1")
+                .bind(id).bind(hash).bind(token).execute(&mut **tx).await?;
+        }
+        let guilds: Vec<i64> = sqlx::query_scalar("SELECT guild_hash FROM guild_members UNION SELECT guild_hash FROM guilds")
+            .fetch_all(&mut **tx).await?;
+        for guild in &guilds {
+            let hash = self.1.id(*guild);
+            sqlx::query("UPDATE guild_members SET guild_hash = $2 WHERE guild_hash = $1").bind(guild).bind(hash).execute(&mut **tx).await?;
+            sqlx::query("UPDATE guilds SET guild_hash = $2 WHERE guild_hash = $1").bind(guild).bind(hash).execute(&mut **tx).await?;
+        }
+        Ok((users.len(), guilds.len()))
+    }
+
     pub async fn user_by_discord(&self, discord_id: i64) -> Result<Option<User>> {
-        Ok(sqlx::query_as("SELECT * FROM users WHERE discord_id = $1").bind(discord_id).fetch_optional(&self.0).await?)
+        Ok(sqlx::query_as("SELECT * FROM users WHERE discord_hash = $1").bind(self.1.id(discord_id)).fetch_optional(&self.0).await?)
+    }
+
+    pub fn token(&self, user: &User) -> Result<Option<String>> {
+        user.lb_token.as_ref().map(|t| self.1.decrypt(t, user.discord_hash)).transpose()
     }
 
     pub async fn user(&self, id: i32) -> Result<User> {
@@ -58,11 +105,13 @@ impl Db {
     }
 
     pub async fn unindexed_users(&self) -> Result<Vec<i32>> {
-        Ok(sqlx::query_scalar("SELECT id FROM users WHERE NOT indexed").fetch_all(&self.0).await?)
+        Ok(sqlx::query_scalar("SELECT id FROM users WHERE NOT indexed AND lb_token IS NOT NULL").fetch_all(&self.0).await?)
     }
 
     /// New user, or a switch to another LB account: the history is indexed from scratch.
-    pub async fn upsert_user(&self, discord_id: i64, lb_name: &str, token: &[u8]) -> Result<i32> {
+    pub async fn upsert_user(&self, discord_id: i64, lb_name: &str, token: &str) -> Result<i32> {
+        let hash = self.1.id(discord_id);
+        let token = self.1.encrypt(token, hash);
         if let Some(old) = self.user_by_discord(discord_id).await? {
             let mut tx = self.0.begin().await?;
             if !old.lb_name.eq_ignore_ascii_case(lb_name) {
@@ -70,12 +119,12 @@ impl Db {
                 sqlx::query("UPDATE users SET last_ts = 0, indexed = false WHERE id = $1").bind(old.id).execute(&mut *tx).await?;
             }
             sqlx::query("UPDATE users SET lb_name = $2, lb_token = $3 WHERE id = $1")
-                .bind(old.id).bind(lb_name).bind(token).execute(&mut *tx).await?;
+                .bind(old.id).bind(lb_name).bind(&token).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok(old.id);
         }
-        Ok(sqlx::query_scalar("INSERT INTO users (discord_id, lb_name, lb_token) VALUES ($1, $2, $3) RETURNING id")
-            .bind(discord_id).bind(lb_name).bind(token).fetch_one(&self.0).await?)
+        Ok(sqlx::query_scalar("INSERT INTO users (discord_hash, lb_name, lb_token) VALUES ($1, $2, $3) RETURNING id")
+            .bind(hash).bind(lb_name).bind(&token).fetch_one(&self.0).await?)
     }
 
     pub async fn delete_user(&self, id: i32) -> Result<()> {
@@ -227,7 +276,8 @@ impl Db {
 
     /// `count_offset`: the lasting difference between LB's count and what we store.
     pub async fn finish_index(&self, user_id: i32, lb_count: i64) -> Result<()> {
-        sqlx::query("UPDATE users SET indexed = true, count_offset = $2 - listens WHERE id = $1")
+        // The token was only needed for the export; the bot keeps no user credentials after this.
+        sqlx::query("UPDATE users SET indexed = true, count_offset = $2 - listens, lb_token = NULL WHERE id = $1")
             .bind(user_id).bind(lb_count as i32).execute(&self.0).await?;
         Ok(())
     }
@@ -266,18 +316,18 @@ impl Db {
         let (table, col) = counter_table(kind);
         let sql = match guild {
             Some(_) => format!(
-                "SELECT gm.name, u.lb_name, u.discord_id, c.plays, count(*) OVER () AS listeners, sum(c.plays) OVER () AS total
-                 FROM {table} c JOIN guild_members gm ON gm.user_id = c.user_id AND gm.guild_id = $2
+                "SELECT gm.name, u.lb_name, u.discord_hash, c.plays, count(*) OVER () AS listeners, sum(c.plays) OVER () AS total
+                 FROM {table} c JOIN guild_members gm ON gm.user_id = c.user_id AND gm.guild_hash = $2
                  JOIN users u ON u.id = c.user_id
                  WHERE c.{col} = $1 ORDER BY c.plays DESC, u.id LIMIT 15"
             ),
             None => format!(
-                "SELECT u.lb_name AS name, u.lb_name, u.discord_id, c.plays, count(*) OVER () AS listeners, sum(c.plays) OVER () AS total
+                "SELECT u.lb_name AS name, u.lb_name, u.discord_hash, c.plays, count(*) OVER () AS listeners, sum(c.plays) OVER () AS total
                  FROM {table} c JOIN users u ON u.id = c.user_id
                  WHERE c.{col} = $1 AND (NOT u.private OR $2::bigint IS NOT NULL) ORDER BY c.plays DESC, u.id LIMIT 15"
             ),
         };
-        Ok(sqlx::query_as(AssertSqlSafe(sql)).bind(id).bind(guild).fetch_all(&self.0).await?)
+        Ok(sqlx::query_as(AssertSqlSafe(sql)).bind(id).bind(guild.map(|g| self.1.id(g))).fetch_all(&self.0).await?)
     }
 
     pub async fn plays(&self, kind: Kind, id: i32, user_id: i32) -> Result<i32> {
@@ -288,34 +338,42 @@ impl Db {
 
     /// Stores one chunk of a server's members (only users registered with the bot are kept).
     pub async fn add_members(&self, guild: i64, members: &[(i64, String)]) -> Result<()> {
-        let (ids, names): (Vec<i64>, Vec<&str>) = members.iter().map(|(i, n)| (*i, n.as_str())).unzip();
+        let (ids, names): (Vec<i64>, Vec<&str>) = members.iter().map(|(i, n)| (self.1.id(*i), n.as_str())).unzip();
         sqlx::query(
-            "INSERT INTO guild_members (guild_id, user_id, name)
-             SELECT $1, u.id, m.n FROM unnest($2::bigint[], $3::text[]) m(d, n) JOIN users u ON u.discord_id = m.d
-             ON CONFLICT (guild_id, user_id) DO UPDATE SET name = EXCLUDED.name WHERE guild_members.name <> EXCLUDED.name",
+            "INSERT INTO guild_members (guild_hash, user_id, name)
+             SELECT $1, u.id, m.n FROM unnest($2::bigint[], $3::text[]) m(d, n) JOIN users u ON u.discord_hash = m.d
+             ON CONFLICT (guild_hash, user_id) DO UPDATE SET name = EXCLUDED.name WHERE guild_members.name <> EXCLUDED.name",
         )
-        .bind(guild).bind(&ids).bind(&names).execute(&self.0).await?;
+        .bind(self.1.id(guild)).bind(&ids).bind(&names).execute(&self.0).await?;
         Ok(())
     }
 
     pub async fn remove_member(&self, guild: i64, discord_id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM guild_members WHERE guild_id = $1 AND user_id = (SELECT id FROM users WHERE discord_id = $2)")
-            .bind(guild).bind(discord_id).execute(&self.0).await?;
+        sqlx::query("DELETE FROM guild_members WHERE guild_hash = $1 AND user_id = (SELECT id FROM users WHERE discord_hash = $2)")
+            .bind(self.1.id(guild)).bind(self.1.id(discord_id)).execute(&self.0).await?;
         Ok(())
     }
 
     pub async fn clear_guild(&self, guild: i64) -> Result<()> {
-        sqlx::query("DELETE FROM guild_members WHERE guild_id = $1").bind(guild).execute(&self.0).await?;
+        sqlx::query("DELETE FROM guild_members WHERE guild_hash = $1").bind(self.1.id(guild)).execute(&self.0).await?;
         Ok(())
     }
 
-    pub async fn prefixes(&self) -> Result<Vec<(i64, String)>> {
-        Ok(sqlx::query_as("SELECT id, prefix FROM guilds").fetch_all(&self.0).await?)
+    /// The bot was removed from a server: drop its member list and prefix.
+    pub async fn forget_guild(&self, guild: i64) -> Result<()> {
+        let mut tx = self.0.begin().await?;
+        sqlx::query("DELETE FROM guild_members WHERE guild_hash = $1").bind(self.1.id(guild)).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM guilds WHERE guild_hash = $1").bind(self.1.id(guild)).execute(&mut *tx).await?;
+        Ok(tx.commit().await?)
+    }
+
+    pub async fn prefix(&self, guild: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT prefix FROM guilds WHERE guild_hash = $1").bind(self.1.id(guild)).fetch_optional(&self.0).await?)
     }
 
     pub async fn set_prefix(&self, guild: i64, prefix: &str) -> Result<()> {
-        sqlx::query("INSERT INTO guilds (id, prefix) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET prefix = $2")
-            .bind(guild).bind(prefix).execute(&self.0).await?;
+        sqlx::query("INSERT INTO guilds (guild_hash, prefix) VALUES ($1, $2) ON CONFLICT (guild_hash) DO UPDATE SET prefix = $2")
+            .bind(self.1.id(guild)).bind(prefix).execute(&self.0).await?;
         Ok(())
     }
 }
@@ -383,9 +441,12 @@ mod tests {
     #[tokio::test]
     async fn store_who_knows_and_clear() -> Result<()> {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else { return Ok(()) };
-        let db = connect(&url).await?;
-        let a = db.upsert_user(1, "alice", b"x").await?;
-        let b = db.upsert_user(2, "bob", b"x").await?;
+        let db = connect(&url, Arc::new(crate::crypto::test_crypto())).await?;
+        let a = db.upsert_user(1, "alice", "token-a").await?;
+        let b = db.upsert_user(2, "bob", "token-b").await?;
+        assert_eq!(db.token(&db.user(a).await?)?.as_deref(), Some("token-a"));
+        let raw: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE discord_hash IN (1, 2)").fetch_one(&db.0).await?;
+        assert_eq!(raw, 0, "raw discord ids must not be stored");
         db.add_members(10, &[(1, "Alice".into()), (2, "Bob".into())]).await?;
 
         let first = vec![listen(100, "Radiohead", "Creep", Some("Pablo Honey")), listen(200, "radiohead", "creep", None)];
@@ -407,12 +468,46 @@ mod tests {
         assert_eq!(db.user(a).await?.listens, 3, "duplicate timestamp must not be counted");
         db.finish_index(a, 5).await?;
         assert_eq!(db.user(a).await?.count_offset, 2);
+        assert_eq!(db.user(a).await?.lb_token, None, "the token is deleted once the first index is done");
 
         db.delete_user(a).await?;
         let rows = db.who_knows(Kind::Artist, artist, None).await?;
         assert_eq!(rows.iter().map(|r| r.plays).collect::<Vec<_>>(), [1]);
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM user_tracks WHERE user_id = $1").bind(a).fetch_one(&db.0).await?;
         assert_eq!(left, 0);
+        Ok(())
+    }
+
+    /// Rows written before migration 0003 (raw ids, old token format) are converted at startup and still work.
+    /// Uses its own database, because the conversion rewrites every row.
+    #[tokio::test]
+    async fn old_rows_get_hashed_ids_and_new_tokens() -> Result<()> {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else { return Ok(()) };
+        let name = format!("lbbot_migration_test_{}", std::process::id());
+        let admin = PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        sqlx::query(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name}"))).execute(&admin).await?;
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await?;
+        let (base, _) = url.rsplit_once('/').expect("database url has a path");
+        let db = connect(&format!("{base}/{name}"), Arc::new(crate::crypto::test_crypto())).await?;
+
+        let (discord, guild) = (555_000_000_000_000_001i64, 555_000_000_000_000_002i64);
+        let id: i32 = sqlx::query_scalar("INSERT INTO users (discord_hash, lb_name, lb_token) VALUES ($1, 'old', $2) RETURNING id")
+            .bind(discord).bind(db.1.encrypt_legacy("old-token")).fetch_one(&db.0).await?;
+        sqlx::query("INSERT INTO guild_members VALUES ($1, $2, 'Old')").bind(guild).bind(id).execute(&db.0).await?;
+        sqlx::query("INSERT INTO guilds VALUES ($1, '!')").bind(guild).execute(&db.0).await?;
+        sqlx::query("DELETE FROM app_state").execute(&db.0).await?;
+
+        db.migrate_hashed_ids().await?;
+        db.migrate_hashed_ids().await?; // runs once: a second start must not hash the ids again
+        let user = db.user_by_discord(discord).await?.expect("user found by its raw discord id");
+        assert_eq!((user.id, user.discord_hash), (id, db.1.id(discord)));
+        assert_eq!(db.token(&user)?.as_deref(), Some("old-token"));
+        assert_eq!(db.prefix(guild).await?.as_deref(), Some("!"));
+        let members: i64 = sqlx::query_scalar("SELECT count(*) FROM guild_members WHERE guild_hash = $1").bind(db.1.id(guild)).fetch_one(&db.0).await?;
+        assert_eq!(members, 1);
+
+        db.0.close().await;
+        sqlx::query(AssertSqlSafe(format!("DROP DATABASE {name}"))).execute(&admin).await?;
         Ok(())
     }
 }

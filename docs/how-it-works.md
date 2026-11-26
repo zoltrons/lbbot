@@ -4,7 +4,7 @@ lbbot is a Discord bot in the style of fmbot, built on ListenBrainz (LB) instead
 
 ## Connecting an account
 
-A user runs `/login` and pastes their LB user token into a Discord modal. The bot checks the token with LB, takes the username from LB's answer, and stores the token encrypted with ChaCha20-Poly1305 (`src/crypto.rs`). The key comes from `TOKEN_KEY`. If that key is lost, stored tokens can't be decrypted and users have to log in again. The text command `.login` doesn't accept a token. It points to `/login` instead, so nobody pastes a token into a public channel.
+A user runs `/login` and pastes their LB user token into a Discord modal. The bot checks the token with LB, takes the username from LB's answer, and stores the token encrypted with XChaCha20-Poly1305, bound to the user (`src/crypto.rs`), until the full index it starts is done. Then the token is deleted. Discord user and server ids are stored only as keyed BLAKE3 hashes. Both use subkeys of `TOKEN_KEY`. If that key is lost, the hashed ids no longer match anyone and users have to log in again. Card images need LB's metadata lookups, which require a token; they use the operator's own `LB_TOKEN`. The text command `.login` doesn't accept a token. It points to `/login` instead, so nobody pastes a token into a public channel.
 
 Logging in with a different LB account deletes the old listening data and indexes the new account from scratch.
 
@@ -18,9 +18,9 @@ The first index downloads the user's full history (`src/ingest.rs`):
 
 Paging is tricky when many listens share the same second, which is common after imports. The pager restarts each page one second before the newest listen it has seen and drops listens it already holds, matched by `recording_msid`.
 
-After the first index, `.update`, `.fm` and `.wk` fetch only listens newer than `last_ts`. `.update` also compares LB's total listen count with the stored count. If they drift apart, the history was changed on LB (a backdated import or a deletion), and the bot reindexes the user from scratch. A small constant difference, such as duplicate listens in the same second, is recorded once as `count_offset` and doesn't trigger a reindex.
+After the first index, `.update`, `.fm` and `.wk` fetch only listens newer than `last_ts`. `.update` also compares LB's total listen count with the stored count. If they drift apart, the history was changed on LB (a backdated import or a deletion). The bot doesn't refetch everything on its own, since paging through a whole history is slow and the export needs the user's token again. `.update` tells the user, and `/login` downloads the full history fresh. A small constant difference, such as duplicate listens in the same second, is recorded once as `count_offset` and isn't reported.
 
-If the bot restarts during an index, that user stays marked as unindexed, and the index starts over on the next boot.
+If the bot restarts during an index, that user stays marked as unindexed and keeps their token, and the index starts over on the next boot.
 
 ## Matching names so counts line up
 
@@ -74,7 +74,7 @@ Cover images, artist photos and tags on the cards come from LB's mapping, MusicB
 
 Like fmbot, the bot changes its profile picture once an hour, on the hour (`src/featured.rs`). It picks a random user who is indexed, hasn't turned on `/privacy`, and has listened in the last 30 days. Then it picks one of four sources at random: that user's 50 newest listens, or their top albums of the week, the month or all time from LB's stats. The first album with a Cover Art Archive cover that hasn't been used in the last 28 days and isn't blocked becomes the new avatar. Albums are compared by MusicBrainz release group, since one album has many releases and each has its own cover. If a user has nothing usable, the bot tries another user, up to five times, then waits for the next hour.
 
-The bot doesn't post who or what was featured; it only writes it to the log. The list of recently used covers lives in memory, so a restart can bring an album back early. Nothing detects explicit covers automatically. When one comes up, the bot owner types `.featured block`: the bot stores the album's release group in `featured_block`, never uses it again, and picks a new avatar right away. If no new album can be set (none found, or Discord refuses the change), it resets the avatar to Discord's default, so the blocked cover doesn't stay up. The reply says which of the two happened. fmbot also skips albums with few listeners; brainzbot doesn't.
+The bot doesn't post who or what was featured; it only writes it to the log. The list of recently used covers lives in memory, so a restart can bring an album back early. Nothing detects explicit covers automatically. When one comes up, the bot owner types `.featured block`: the bot stores the album's release group in `featured_block`, never uses it again, and picks a new avatar right away. If no new album can be set (none found, or Discord refuses the change), it resets the avatar to Discord's default, so the blocked cover doesn't stay up. The reply says which of the two happened. fmbot also skips albums with few listeners; lbbot doesn't.
 
 ## Deleting data
 

@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
-    crypto::Crypto,
     db::{Db, User},
     history::Entry,
     lb::{Lb, Listen, PAGE, Prio},
@@ -22,7 +21,6 @@ use crate::{
 pub struct Ingest {
     pub db: Db,
     pub lb: Lb,
-    pub crypto: Crypto,
     busy: Mutex<HashSet<i32>>,
     /// Number of exports downloaded and parsed at the same time (for disk and memory).
     exports: Semaphore,
@@ -37,8 +35,8 @@ impl Drop for BusyGuard<'_> {
 }
 
 impl Ingest {
-    pub fn new(db: Db, lb: Lb, crypto: Crypto) -> Arc<Self> {
-        Arc::new(Self { db, lb, crypto, busy: Mutex::default(), exports: Semaphore::new(2) })
+    pub fn new(db: Db, lb: Lb) -> Arc<Self> {
+        Arc::new(Self { db, lb, busy: Mutex::default(), exports: Semaphore::new(2) })
     }
 
     fn claim(&self, user_id: i32) -> Option<BusyGuard<'_>> {
@@ -64,7 +62,8 @@ impl Ingest {
         // Marked after the claim is taken: if it is cut off, it starts again at boot and on `.update`.
         self.db.mark_unindexed(user_id).await?;
         let user = self.db.user(user_id).await?;
-        let token = self.crypto.decrypt(&user.lb_token)?;
+        // Every full index starts from /login, which stores the token until this index finishes.
+        let token = self.db.token(&user)?.context("no token stored; the user has to /login again")?;
         let entries = match self.export_entries(&token).await {
             Ok(e) => e,
             Err(e) => {
@@ -82,9 +81,10 @@ impl Ingest {
         self.db.finish_index(user_id, lb_count).await
     }
 
-    /// `update` plus a comparison with LB's total count. After a backdated import or a deletion
-    /// the counts differ and the history is indexed from scratch. `true` = a reindex started.
-    pub async fn sync(self: &Arc<Self>, user: &User) -> Result<(usize, bool)> {
+    /// `update` plus a comparison with LB's total count. After a backdated import or a deletion the counts
+    /// differ: `true` then means the stored history is out of date. Nothing is refetched automatically,
+    /// because a full download needs the user's token again (`/login`) and paging all of it is wasteful.
+    pub async fn sync(&self, user: &User) -> Result<(usize, bool)> {
         let mut added = 0;
         // Two tries: if a new listen arrives between counting and fetching, the second round covers it.
         for _ in 0..2 {
@@ -98,7 +98,6 @@ impl Ingest {
             }
             tracing::info!(user_id = user.id, lb_count, stored = now.listens, "count drift");
         }
-        self.spawn_index(user.id);
         Ok((added, true))
     }
 
@@ -287,7 +286,7 @@ mod tests {
     #[ignore]
     async fn live_pager() {
         let user = std::env::var("LB_USER").unwrap_or_else(|_| "rob".into());
-        let lb = crate::lb::Lb::new();
+        let lb = crate::lb::Lb::new(String::new());
         let mut pager = super::Pager::new(0);
         let mut ids = std::collections::HashSet::new();
         let mut total = 0;

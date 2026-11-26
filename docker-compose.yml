@@ -5,9 +5,16 @@ services:
     image: ghcr.io/zoltrons/lbbot:latest
     build: .
     restart: unless-stopped
+    # The bot only needs to write export downloads to /tmp.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - exports:/tmp
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
       TOKEN_KEY: ${TOKEN_KEY}
+      LB_TOKEN: ${LB_TOKEN}
       DATABASE_URL: postgres://lbbot:${POSTGRES_PASSWORD}@db/lbbot
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
@@ -32,3 +39,4 @@ services:
 
 volumes:
   pgdata:
+  exports:

@@ -22,8 +22,12 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let token = var("DISCORD_TOKEN")?;
-    let db = db::connect(&var("DATABASE_URL")?).await?;
-    let ingest = ingest::Ingest::new(db.clone(), lb::Lb::new(), crypto::Crypto::from_base64(&var("TOKEN_KEY")?)?);
+    let crypto = Arc::new(crypto::Crypto::from_base64(&var("TOKEN_KEY")?)?);
+    let db = db::connect(&var("DATABASE_URL")?, crypto).await?;
+    let lb = lb::Lb::new(var("LB_TOKEN")?);
+    // Card images need a valid token for LB's metadata endpoints; fail at startup rather than on every card.
+    anyhow::ensure!(lb.validate_token(&var("LB_TOKEN")?).await?.is_some(), "LB_TOKEN is not a valid ListenBrainz token");
+    let ingest = ingest::Ingest::new(db.clone(), lb);
     // Indexes cut off by a restart start over from the beginning.
     for id in db.unindexed_users().await? {
         ingest.spawn_index(id);
@@ -43,7 +47,7 @@ async fn main() -> Result<()> {
         http: http.clone(),
         app_id,
         ingest,
-        prefixes: std::sync::RwLock::new(db.prefixes().await?.into_iter().collect()),
+        prefixes: Default::default(),
         guild_names: Default::default(),
         art_cache: Default::default(),
         featured,
@@ -65,6 +69,7 @@ async fn main() -> Result<()> {
 
 async fn run_shard(mut shard: Shard, bot: Arc<bot::Bot>) {
     let wanted = EventTypeFlags::GUILD_CREATE
+        | EventTypeFlags::GUILD_DELETE
         | EventTypeFlags::GUILD_UPDATE
         | EventTypeFlags::MEMBER_CHUNK
         | EventTypeFlags::MEMBER_ADD
