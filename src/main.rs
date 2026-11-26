@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
 
     let featured = Arc::new(featured::Featured::default());
     tokio::spawn(featured::run(featured.clone(), http.clone(), ingest.clone()));
+    tokio::spawn(ingest::refresh_loop(ingest.clone()));
 
     let bot = Arc::new(bot::Bot {
         http: http.clone(),

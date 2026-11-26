@@ -143,6 +143,13 @@ impl Db {
         Ok(())
     }
 
+    /// Indexed users who listened in the last 30 days, for the twice-daily refresh. Uses the newest stored
+    /// listen as the activity signal, so the bot doesn't track when people use it.
+    pub async fn active_users(&self) -> Result<Vec<User>> {
+        Ok(sqlx::query_as("SELECT * FROM users WHERE indexed AND last_ts > extract(epoch FROM now())::bigint - 30 * 86400")
+            .fetch_all(&self.0).await?)
+    }
+
     /// A random user for the bot's avatar: indexed, not private, listened in the last 30 days.
     /// Also returns a random number 0..4 for the pick mode.
     pub async fn featured_user(&self) -> Result<Option<(String, i32)>> {
@@ -476,10 +483,16 @@ mod tests {
         db.finish_index(a, 5).await?;
         assert_eq!(db.user(a).await?.count_offset, 2);
         assert_eq!(db.user(a).await?.lb_token, None, "the token is deleted once the first index is done");
+        // Only users who listened in the last 30 days get the background refresh.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+        sqlx::query("UPDATE users SET indexed = true WHERE id = $1").bind(b).execute(&db.0).await?;
+        db.store(b, db.intern(&[listen(now, "Radiohead", "Creep", None)]).await?, false).await?;
+        let active: Vec<i32> = db.active_users().await?.iter().map(|u| u.id).collect();
+        assert!(active.contains(&b) && !active.contains(&a), "{active:?}");
 
         db.delete_user(a).await?;
         let rows = db.who_knows(Kind::Artist, artist, None).await?;
-        assert_eq!(rows.iter().map(|r| r.plays).collect::<Vec<_>>(), [1]);
+        assert_eq!(rows.iter().map(|r| r.plays).collect::<Vec<_>>(), [2], "only bob is left, with his two listens");
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM user_tracks WHERE user_id = $1").bind(a).fetch_one(&db.0).await?;
         assert_eq!(left, 0);
         Ok(())

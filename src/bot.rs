@@ -417,7 +417,7 @@ impl Bot {
                 })
             }
             Cmd::Fm => {
-                let (now, updated) = tokio::join!(self.ingest.lb.now_or_last(&user.lb_name), self.ingest.update(&user));
+                let (now, updated) = tokio::join!(self.ingest.lb.now_or_last(&user.lb_name), self.ingest.update(&user, crate::lb::Prio::Command));
                 if let Err(e) = updated {
                     tracing::warn!(error = ?e, "update during fm failed");
                 }
@@ -477,7 +477,7 @@ impl Bot {
                         (t.artist_name, name)
                     }
                 };
-                if let Err(e) = self.ingest.update(&user).await {
+                if let Err(e) = self.ingest.update(&user, crate::lb::Prio::Command).await {
                     tracing::warn!(error = ?e, "update during wk failed");
                 }
                 let Some((id, title)) = self.db().find(kind, &artist, name.as_deref()).await? else {

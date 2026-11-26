@@ -90,7 +90,7 @@ impl Ingest {
         for _ in 0..2 {
             let lb_count = self.lb.listen_count(&user.lb_name, Prio::Command).await?;
             let fresh = self.db.user(user.id).await?;
-            let Some(n) = self.update(&fresh).await? else { return Ok((added, false)) };
+            let Some(n) = self.update(&fresh, Prio::Command).await? else { return Ok((added, false)) };
             added += n;
             let now = self.db.user(user.id).await?;
             if lb_count - now.listens as i64 == now.count_offset as i64 {
@@ -103,12 +103,12 @@ impl Ingest {
 
     /// Fetches recent listens and returns how many were new.
     /// `None`: the user isn't indexed or another job holds them; nothing was done.
-    pub async fn update(&self, user: &User) -> Result<Option<usize>> {
+    pub async fn update(&self, user: &User, prio: Prio) -> Result<Option<usize>> {
         if !user.indexed {
             return Ok(None);
         }
         let Some(_guard) = self.claim(user.id) else { return Ok(None) };
-        let entries = self.pages(&user.lb_name, user.last_ts, Prio::Command).await?;
+        let entries = self.pages(&user.lb_name, user.last_ts, prio).await?;
         let n = entries.len();
         self.db.store(user.id, entries, false).await?;
         Ok(Some(n))
@@ -203,6 +203,37 @@ impl Pager {
         self.cursor = newest - 1;
         (fresh, !full)
     }
+}
+
+/// Like fmbot, twice a day: fetches new listens for users who don't run commands, so WhoKnows lists show
+/// everyone's current counts. Users who ran a command meanwhile only cost one request.
+pub async fn refresh_loop(ingest: Arc<Ingest>) {
+    loop {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        tokio::time::sleep(Duration::from_secs(secs_until_refresh(now))).await;
+        let users = match ingest.db.active_users().await {
+            Ok(users) => users,
+            Err(e) => {
+                tracing::warn!(error = ?e, "refresh: listing users failed");
+                continue;
+            }
+        };
+        let mut added = 0;
+        for user in &users {
+            match ingest.update(user, Prio::Background).await {
+                Ok(n) => added += n.unwrap_or(0),
+                Err(e) => tracing::warn!(user_id = user.id, error = ?e, "refresh failed"),
+            }
+        }
+        tracing::info!(users = users.len(), added, "refreshed listens");
+    }
+}
+
+/// Seconds until the next 06:00 or 14:00 UTC (fmbot's update times).
+fn secs_until_refresh(now: u64) -> u64 {
+    const DAY: u64 = 86_400;
+    let today = now - now % DAY;
+    [6, 14, 30].iter().map(|h| today + h * 3600).find(|&t| t > now).expect("06:00 tomorrow is later") - now
 }
 
 fn read_export(path: &std::path::Path, tx: mpsc::Sender<Vec<Listen>>) -> Result<()> {
@@ -301,6 +332,15 @@ mod tests {
         }
         println!("{user}: {total} listens, {} unique", ids.len());
         assert_eq!(total, ids.len(), "pager returned duplicates");
+    }
+
+    #[test]
+    fn refresh_runs_at_six_and_fourteen_utc() {
+        let day = 20_000 * 86_400;
+        assert_eq!(super::secs_until_refresh(day), 6 * 3600);
+        assert_eq!(super::secs_until_refresh(day + 6 * 3600), 8 * 3600);
+        assert_eq!(super::secs_until_refresh(day + 14 * 3600 - 1), 1);
+        assert_eq!(super::secs_until_refresh(day + 20 * 3600), 10 * 3600);
     }
 
     #[test]
