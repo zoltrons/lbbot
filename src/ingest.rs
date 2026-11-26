@@ -22,8 +22,9 @@ pub struct Ingest {
     pub db: Db,
     pub lb: Lb,
     busy: Mutex<HashSet<i32>>,
-    /// Number of exports downloaded and parsed at the same time (for disk and memory).
-    exports: Semaphore,
+    /// Full indexes processed at the same time: download and parse (or page through) a whole history and write it.
+    /// The rest wait their turn in order, so many logins at once don't spike memory and disk.
+    heavy: Semaphore,
 }
 
 /// Removes the user from the busy set when the work ends.
@@ -36,7 +37,7 @@ impl Drop for BusyGuard<'_> {
 
 impl Ingest {
     pub fn new(db: Db, lb: Lb) -> Arc<Self> {
-        Arc::new(Self { db, lb, busy: Mutex::default(), exports: Semaphore::new(2) })
+        Arc::new(Self { db, lb, busy: Mutex::default(), heavy: Semaphore::new(2) })
     }
 
     fn claim(&self, user_id: i32) -> Option<BusyGuard<'_>> {
@@ -71,7 +72,10 @@ impl Ingest {
         let user = self.db.user(user_id).await?;
         // Every full index starts from /login, which stores the token until this index finishes.
         let token = self.db.token(&user)?.context("no token stored; the user has to /login again")?;
-        let entries = match self.export_entries(&token).await {
+        // Waiting for LB to build the export holds no slot; everything after it does.
+        let export = self.wait_export(&token).await;
+        let _permit = self.heavy.acquire().await?;
+        let entries = match async { self.export_entries(&token, export?).await }.await {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(user_id, error = ?e, "export failed, falling back to paging");
@@ -138,7 +142,8 @@ impl Ingest {
         Ok(out)
     }
 
-    async fn export_entries(&self, token: &str) -> Result<Vec<Entry>> {
+    /// Asks LB for an export and waits until it is ready; returns its id.
+    async fn wait_export(&self, token: &str) -> Result<i64> {
         let id = self.lb.export(token).await?;
         let mut delay = 30;
         let mut waited = 0;
@@ -153,9 +158,10 @@ impl Ingest {
             waited += delay;
             delay = (delay * 2).min(120);
         }
+        Ok(id)
+    }
 
-        // Only download and parsing are limited; exports waiting in LB's queue don't hold a slot.
-        let _permit = self.exports.acquire().await?;
+    async fn export_entries(&self, token: &str, id: i64) -> Result<Vec<Entry>> {
         let path = std::env::temp_dir().join(format!("lbbot-export-{id}.zip"));
         let _cleanup = RemoveOnDrop(path.clone());
         self.lb.download_export(token, id, &path).await?;

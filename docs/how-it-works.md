@@ -12,7 +12,7 @@ Logging in with a different LB account deletes the old listening data and indexe
 
 The first index downloads the user's full history (`src/ingest.rs`):
 
-1. The bot asks LB for an export ZIP with the user's token, polls until LB finishes it, downloads it and reads the `listens/*.jsonl` files in batches of 5000. At most two exports are downloaded and parsed at the same time, to limit disk and memory use.
+1. The bot asks LB for an export ZIP with the user's token, polls until LB finishes it, downloads it and reads the `listens/*.jsonl` files in batches of 5000. Indexes take turns: at most two at a time download, parse (or page through) and write a whole history, so many logins at once don't spike disk and memory. Waiting for LB to build an export doesn't take a turn.
 2. If the export fails, or isn't ready after two hours, the bot falls back to paging through `/1/user/{name}/listens`.
 3. Listens that arrived while the export was being built are fetched by paging from the newest stored timestamp.
 
