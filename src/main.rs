@@ -26,7 +26,12 @@ async fn main() -> Result<()> {
     let db = db::connect(&var("DATABASE_URL")?, crypto).await?;
     let lb = lb::Lb::new(var("LB_TOKEN")?);
     // Card images need a valid token for LB's metadata endpoints; fail at startup rather than on every card.
-    anyhow::ensure!(lb.validate_token(&var("LB_TOKEN")?).await?.is_some(), "LB_TOKEN is not a valid ListenBrainz token");
+    // An LB outage shouldn't keep the bot down: WhoKnows works from the database.
+    match lb.validate_token(&var("LB_TOKEN")?).await {
+        Ok(Some(_)) => {}
+        Ok(None) => anyhow::bail!("LB_TOKEN is not a valid ListenBrainz token"),
+        Err(e) => tracing::warn!(error = ?e, "couldn't check LB_TOKEN, ListenBrainz may be down"),
+    }
     let ingest = ingest::Ingest::new(db.clone(), lb);
     // Indexes cut off by a restart start over from the beginning.
     for id in db.unindexed_users().await? {

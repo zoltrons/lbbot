@@ -16,7 +16,7 @@ Users connect with their ListenBrainz user token. The bot needs it once, to requ
 
 Anyone who has both the database and `TOKEN_KEY` can decrypt every token. Keep the key separate from database backups.
 
-There is no key rotation. Changing `TOKEN_KEY` makes every hashed id unrecognizable, so every user has to log in again.
+There is no key rotation. Changing `TOKEN_KEY` would make every hashed id unrecognizable, so the database stores a fingerprint of the key it was set up with, and the bot refuses to start with a different one.
 
 ## Hashed Discord ids
 
@@ -33,7 +33,7 @@ Display names in each server are stored in plain text, because WhoKnows lists sh
 - `/prefix` and `/refreshmembers` require the Manage Server permission, which Discord enforces. Deleting data requires an explicit confirmation.
 - The Docker image runs the bot as the unprivileged `nobody` user. The provided `docker-compose.yml` also gives it a read-only file system, drops all Linux capabilities and blocks privilege escalation. Its only writable directory is `/tmp`, for export downloads, which are created readable by that user only.
 - Logs don't contain Discord ids, command text or replies.
-- Secrets come only from environment variables. `.env` is listed in `.gitignore`. The bot checks `LB_TOKEN` with ListenBrainz at startup and refuses to start with an invalid one.
+- Secrets come only from environment variables. `.env` is listed in `.gitignore`. The bot checks `LB_TOKEN` with ListenBrainz at startup and refuses to start if ListenBrainz says it is invalid. If ListenBrainz can't be reached, it logs a warning and starts anyway.
 
 ## Running the bot safely
 

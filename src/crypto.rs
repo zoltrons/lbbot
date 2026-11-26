@@ -40,6 +40,11 @@ impl Crypto {
         i64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes"))
     }
 
+    /// Identifies `TOKEN_KEY` without revealing it, so a wrong key is caught before it hashes anything.
+    pub fn key_check(&self) -> String {
+        format!("{:016x}", self.id(0))
+    }
+
     /// Short form of `id` for logs.
     pub fn log_id(&self, discord_id: i64) -> String {
         format!("{:08x}", self.id(discord_id) as u32)

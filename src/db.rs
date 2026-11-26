@@ -62,9 +62,16 @@ impl Db {
         let mut tx = self.0.begin().await?;
         // Two processes starting together must not both convert (and hash the ids twice).
         sqlx::query("SELECT pg_advisory_xact_lock(7262871)").execute(&mut *tx).await?;
+        // Hashes made with a different key match nobody; refuse to start instead of orphaning every user.
+        let check = format!("key:{}", self.1.key_check());
+        let keys: Vec<String> = sqlx::query_scalar("SELECT name FROM app_state WHERE name LIKE 'key:%'").fetch_all(&mut *tx).await?;
+        anyhow::ensure!(keys.iter().all(|k| *k == check), "TOKEN_KEY differs from the key this database was set up with");
+        if keys.is_empty() {
+            sqlx::query("INSERT INTO app_state VALUES ($1)").bind(&check).execute(&mut *tx).await?;
+        }
         let done: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM app_state WHERE name = 'hashed_ids')").fetch_one(&mut *tx).await?;
         if done {
-            return Ok(());
+            return Ok(tx.commit().await?);
         }
         let (users, guilds) = self.hash_ids(&mut tx).await?;
         sqlx::query("INSERT INTO app_state VALUES ('hashed_ids')").execute(&mut *tx).await?;
@@ -499,6 +506,8 @@ mod tests {
 
         db.migrate_hashed_ids().await?;
         db.migrate_hashed_ids().await?; // runs once: a second start must not hash the ids again
+        let other = Db(db.0.clone(), Arc::new(crate::crypto::Crypto::from_base64("HxwdHh8AAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRo=")?));
+        assert!(other.migrate_hashed_ids().await.is_err(), "a different TOKEN_KEY must be refused");
         let user = db.user_by_discord(discord).await?.expect("user found by its raw discord id");
         assert_eq!((user.id, user.discord_hash), (id, db.1.id(discord)));
         assert_eq!(db.token(&user)?.as_deref(), Some("old-token"));

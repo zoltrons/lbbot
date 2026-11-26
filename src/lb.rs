@@ -469,11 +469,12 @@ impl Lb {
         Ok(body.as_array().into_iter().flatten().find_map(|rg| cover_url(&rg["release_group"])))
     }
 
-    /// The newest pending or completed full-history export, or a new one.
+    /// A full-history export still being built, or a new one. Completed exports aren't reused: they can predate
+    /// an import, and `/login` is how a user asks for a fresh download.
     pub async fn export(&self, token: &str) -> Result<i64> {
         let list = self.json(self.req(Method::GET, &["1", "export", "list"], Some(token)), Prio::Background).await?;
         let list: Vec<Export> = serde_json::from_value(list)?;
-        let full = |e: &&Export| e.status != "failed" && e.start_time.is_none() && e.end_time.is_none();
+        let full = |e: &&Export| matches!(e.status.as_str(), "waiting" | "in_progress") && e.start_time.is_none() && e.end_time.is_none();
         if let Some(e) = list.iter().find(full) {
             return Ok(e.export_id);
         }
@@ -727,6 +728,20 @@ mod tests {
     }
 
     const COUNT: &str = r#"{"payload":{"count":5}}"#;
+
+    /// A completed export can predate an import, so `/login` must ask for a new one; a pending one is reused.
+    #[tokio::test]
+    async fn export_reuses_only_pending_exports() {
+        const COMPLETED: &str = r#"[{"export_id": 1, "status": "completed", "start_time": null, "end_time": null}]"#;
+        const CREATED: &str = r#"{"export_id": 2, "status": "waiting", "start_time": null, "end_time": null}"#;
+        const PENDING: &str = r#"[{"export_id": 3, "status": "in_progress", "start_time": null, "end_time": null}]"#;
+        let (addr, server) = fake_lb(&[(200, 10, COMPLETED), (200, 10, CREATED), (200, 10, PENDING)]).await;
+        let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
+        assert_eq!(lb.export("t").await.unwrap(), 2);
+        assert_eq!(lb.export("t").await.unwrap(), 3);
+        let paths: Vec<String> = server.await.unwrap().into_iter().map(|(_, p)| p).collect();
+        assert_eq!(paths, ["/1/export/list", "/1/export/", "/1/export/list"]);
+    }
 
     /// LB's bot-check page isn't JSON; the request must be retried.
     #[tokio::test]
