@@ -2,9 +2,11 @@ mod bot;
 mod crypto;
 mod db;
 mod featured;
+mod hist;
 mod history;
 mod ingest;
 mod lb;
+mod stats;
 
 use std::{env, sync::Arc};
 
@@ -80,7 +82,7 @@ async fn main() -> Result<()> {
 
 const DESCRIPTION: &str = "Shows what you're listening to and who in your server listens to the same artist, album or track, from your ListenBrainz history. Start with /login.\n\nOpen source: https://github.com/zoltrons/lbbot";
 
-/// fmbot-style status: ".fm — lbbot — N servers", refreshed every 10 minutes on every shard.
+/// fmbot-style status: ".np — lbbot — N servers", refreshed every 10 minutes on every shard.
 async fn presence_loop(senders: Vec<twilight_gateway::MessageSender>, bot: Arc<bot::Bot>) {
     use twilight_model::gateway::{
         payload::outgoing::UpdatePresence,
@@ -105,7 +107,7 @@ async fn presence_loop(senders: Vec<twilight_gateway::MessageSender>, bot: Arc<b
             name: "Custom Status".into(),
             party: None,
             secrets: None,
-            state: Some(format!(".fm — lbbot — {servers} servers")),
+            state: Some(format!(".np — lbbot — {servers} servers")),
             state_url: None,
             timestamps: None,
             url: None,

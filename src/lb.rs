@@ -462,6 +462,53 @@ impl Lb {
         Ok(body[recording_mbid]["release"].take())
     }
 
+    /// ListenBrainz-wide listener count of each artist, found from one of their tracks: `(artist, track)` in,
+    /// counts out in the same order (`None` when unmatched). At most 50 pairs (LB's bulk lookup limit).
+    pub async fn artist_listeners(&self, pairs: &[(String, String)]) -> Result<Vec<Option<i64>>> {
+        // LB refuses the whole request if one pair is empty or over 250 characters; those stay unmatched.
+        let sent: Vec<usize> = (0..pairs.len())
+            .filter(|&i| {
+                let (a, t) = &pairs[i];
+                !a.is_empty() && !t.is_empty() && a.chars().count() + t.chars().count() <= 250
+            })
+            .collect();
+        if sent.is_empty() {
+            return Ok(vec![None; pairs.len()]);
+        }
+        let recordings: Vec<Value> =
+            sent.iter().map(|&i| serde_json::json!({"artist_name": pairs[i].0, "recording_name": pairs[i].1})).collect();
+        let req = self
+            .http
+            .post(self.url(&["1", "metadata", "lookup", ""], &[]))
+            .header("Authorization", format!("Token {}", self.service_token))
+            .json(&serde_json::json!({ "recordings": recordings }));
+        let found = self.json(req, Prio::Command).await?;
+        // Results keep the request order and carry its `index`; a match credited to another artist (wrong mapping) is dropped.
+        let mut mbids: Vec<Option<String>> = vec![None; pairs.len()];
+        for r in found.as_array().into_iter().flatten() {
+            let (Some(i), Some(mbid), Some(credit)) = (r["index"].as_u64(), r["artist_mbids"][0].as_str(), r["artist_credit_name"].as_str()) else {
+                continue;
+            };
+            let Some(&i) = sent.get(i as usize) else { continue };
+            if credit.to_lowercase().starts_with(&pairs[i].0.to_lowercase()) {
+                mbids[i] = Some(mbid.to_owned());
+            }
+        }
+        let known: Vec<&str> = mbids.iter().flatten().map(String::as_str).collect();
+        if known.is_empty() {
+            return Ok(vec![None; pairs.len()]);
+        }
+        let req = self.http.post(self.url(&["1", "popularity", "artist"], &[])).json(&serde_json::json!({ "artist_mbids": known }));
+        let counts = self.json(req, Prio::Command).await?;
+        let by_mbid: std::collections::HashMap<&str, i64> = counts
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| Some((c["artist_mbid"].as_str()?, c["total_user_count"].as_i64()?)))
+            .collect();
+        Ok(mbids.iter().map(|m| m.as_deref().and_then(|m| by_mbid.get(m).copied())).collect())
+    }
+
     /// Cover of the artist's most popular album; LB/MB have no artist photos.
     pub async fn artist_cover(&self, artist_mbid: &str) -> Result<Option<String>> {
         let req = self.req(Method::GET, &["1", "popularity", "top-release-groups-for-artist", artist_mbid], Some(&self.service_token));

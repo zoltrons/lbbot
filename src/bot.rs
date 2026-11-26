@@ -30,7 +30,7 @@ use twilight_model::{
 };
 use twilight_util::builder::{
     interaction_response::{ChannelMessageBuilder, ModalBuilder},
-    command::{BooleanBuilder, CommandBuilder, StringBuilder},
+    command::{BooleanBuilder, CommandBuilder, StringBuilder, UserBuilder},
     embed::{EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder, ImageSource},
 };
 
@@ -38,7 +38,7 @@ use crate::{db::{Db, Kind}, ingest::Ingest};
 
 const DEFAULT_PREFIX: &str = ".";
 const SETTINGS: &str = "[listenbrainz.org/settings](https://listenbrainz.org/settings/)";
-const COLOR: u32 = 0x353070;
+pub(crate) const COLOR: u32 = 0x353070;
 
 pub struct Bot {
     pub http: Arc<Client>,
@@ -53,6 +53,9 @@ pub struct Bot {
     /// Discord id of the application owner, for owner-only commands.
     pub owner: Option<i64>,
 }
+
+/// (artist, album or track name, (playing track name, its mapping))
+pub(crate) type Subject = (String, Option<String>, (Option<String>, Value));
 
 /// (kind, lowercase artist, lowercase album/track)
 pub type ArtKey = (Kind, String, String);
@@ -70,7 +73,7 @@ const ART_CACHE_MAX: usize = 10_000;
 enum Cmd {
     Login,
     Update,
-    Fm,
+    Np,
     Wk { kind: Kind, global: bool, query: Option<String> },
     Prefix(Option<String>),
     Privacy,
@@ -79,15 +82,37 @@ enum Cmd {
     RefreshMembers,
     /// Owner only, text only: ban the current avatar's album and pick another one.
     FeaturedBlock,
+    /// Commands computed from the stored history; `arg` is the rest of the text, parsed by each command.
+    Hist { cmd: Hc, kind: Kind, arg: String },
 }
 
-struct Ctx {
-    discord_id: i64,
-    guild: Option<i64>,
-    name: String,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Hc {
+    Overview,
+    Streak,
+    Streaks,
+    Gaps,
+    Discoveries,
+    DiscoveryDate,
+    LastListened,
+    Pace,
+    ArtistPace,
+    Milestone,
+    Year,
+    Recap,
+    Taste,
+    Affinity,
+    Iceberg,
+    Receipt,
 }
 
-fn reply(text: impl Into<String>) -> Embed {
+pub(crate) struct Ctx {
+    pub discord_id: i64,
+    pub guild: Option<i64>,
+    pub name: String,
+}
+
+pub(crate) fn reply(text: impl Into<String>) -> Embed {
     EmbedBuilder::new().color(COLOR).description(text).build()
 }
 
@@ -95,10 +120,31 @@ fn reply(text: impl Into<String>) -> Embed {
 fn parse_text(word: &str, rest: &str) -> Option<Cmd> {
     let query = (!rest.is_empty()).then(|| rest.to_owned());
     let wk = |kind, global| Some(Cmd::Wk { kind, global, query: query.clone() });
+    let hist = |cmd, kind| Some(Cmd::Hist { cmd, kind, arg: rest.to_owned() });
     match word {
+        "overview" | "o" | "ov" => hist(Hc::Overview, Kind::Artist),
+        "streak" | "str" | "combo" | "cb" => hist(Hc::Streak, Kind::Artist),
+        "streaks" | "combos" | "streakhistory" => hist(Hc::Streaks, Kind::Artist),
+        "gaps" | "gap" => hist(Hc::Gaps, Kind::Artist),
+        "discoveries" | "discovered" | "discovery" => hist(Hc::Discoveries, Kind::Artist),
+        "discoverydate" | "dd" | "firstlistened" => hist(Hc::DiscoveryDate, Kind::Artist),
+        "albumdiscoverydate" | "dda" => hist(Hc::DiscoveryDate, Kind::Album),
+        "trackdiscoverydate" | "ddt" => hist(Hc::DiscoveryDate, Kind::Track),
+        "lastlistened" | "ll" | "lastplayed" => hist(Hc::LastListened, Kind::Artist),
+        "albumlastlistened" | "lla" => hist(Hc::LastListened, Kind::Album),
+        "tracklastlistened" | "llt" => hist(Hc::LastListened, Kind::Track),
+        "pace" | "pc" => hist(Hc::Pace, Kind::Artist),
+        "artistpace" | "apc" | "apace" => hist(Hc::ArtistPace, Kind::Artist),
+        "milestone" | "ms" | "mls" => hist(Hc::Milestone, Kind::Artist),
+        "year" | "yr" | "yearoverview" => hist(Hc::Year, Kind::Artist),
+        "recap" | "rc" => hist(Hc::Recap, Kind::Artist),
+        "taste" | "t" | "tst" => hist(Hc::Taste, Kind::Artist),
+        "affinity" | "aff" | "neighbors" | "n" => hist(Hc::Affinity, Kind::Artist),
+        "iceberg" | "ice" | "icebergify" | "berg" => hist(Hc::Iceberg, Kind::Artist),
+        "receipt" | "rcpt" | "receiptify" => hist(Hc::Receipt, Kind::Artist),
         "login" | "set" | "setusername" | "connect" => Some(Cmd::Login),
         "update" | "u" => Some(Cmd::Update),
-        "fm" | "np" | "nowplaying" => Some(Cmd::Fm),
+        "np" | "nowplaying" => Some(Cmd::Np),
         "whoknows" | "w" | "wk" | "thosewhoknow" => wk(Kind::Artist, false),
         "whoknowsalbum" | "wa" | "wka" | "wkab" | "wab" | "wkal" | "wkalbum" => wk(Kind::Album, false),
         "whoknowstrack" | "wt" | "wkt" | "wktr" | "wtr" | "wktrack" => wk(Kind::Track, false),
@@ -118,10 +164,10 @@ fn parse_text(word: &str, rest: &str) -> Option<Cmd> {
 pub fn slash_commands() -> Vec<Command> {
     let cmd = |name: &str, desc: &str| CommandBuilder::new(name, desc, CommandType::ChatInput);
     let query = |desc: &str| StringBuilder::new("query", desc).required(false);
-    vec![
+    let mut out = vec![
         cmd("login", "Connect your ListenBrainz account").build(),
         cmd("update", "Fetch your latest listens").build(),
-        cmd("fm", "Your current or last played track").build(),
+        cmd("np", "Your current or last played track").build(),
         cmd("wk", "Who listens to an artist in this server").option(query("Artist")).build(),
         cmd("wkalbum", "Who listens to an album in this server").option(query("Artist - Album")).build(),
         cmd("wktrack", "Who listens to a track in this server").option(query("Artist - Track")).build(),
@@ -140,8 +186,43 @@ pub fn slash_commands() -> Vec<Command> {
         cmd("refreshmembers", "Reload this server's member list from Discord")
             .default_member_permissions(Permissions::MANAGE_GUILD)
             .build(),
-    ]
+    ];
+    for (name, desc, hint) in HIST_SLASH {
+        let mut c = cmd(name, desc);
+        if matches!(name, "discoverydate" | "lastlistened") {
+            let kind = StringBuilder::new("type", "Artist, album or track").required(false);
+            c = c.option(kind.choices([("Artist", "artist"), ("Album", "album"), ("Track", "track")]));
+        }
+        if name == "taste" {
+            c = c.option(UserBuilder::new("user", "Who to compare with").required(true));
+        }
+        if !hint.is_empty() {
+            c = c.option(StringBuilder::new("options", hint).required(false));
+        }
+        out.push(c.build());
+    }
+    out
 }
+
+/// Slash versions of the history commands: (name, description, hint for the free-text options; empty = none).
+const HIST_SLASH: [(&str, &str, &str); 16] = [
+    ("overview", "Your last days: plays and top artist, album and track per day", "Number of days (1-7)"),
+    ("streak", "Your current artist, album and track streak", ""),
+    ("streaks", "Your longest streaks", "artists, albums or tracks"),
+    ("gaps", "What you came back to after the longest break", "artists, albums or tracks"),
+    ("discoveries", "Artists you discovered recently", "Period (week, month, year, 90d…) and artists/albums/tracks"),
+    ("discoverydate", "When you first listened to something", "Artist or Artist - Name"),
+    ("lastlistened", "When you last listened to something", "Artist or Artist - Name"),
+    ("pace", "When you'll reach a play count", "Goal and period, e.g. 50000 week"),
+    ("artistpace", "When you'll reach a play count for an artist", "Goal and artist, e.g. 1000 Radiohead"),
+    ("milestone", "Your nth listen", "Listen number"),
+    ("year", "Your year in music", "Year"),
+    ("recap", "Summary of a period", "Period (week, month, year, 90d…)"),
+    ("taste", "Compare your taste with someone", "Period (week, month, year…)"),
+    ("affinity", "Who in this server listens most like you", ""),
+    ("iceberg", "Your artists by how known they are on ListenBrainz", "Period (week, month, year…)"),
+    ("receipt", "Your top tracks as a receipt", "Period (week, month, year…)"),
+];
 
 fn parse_slash(data: &CommandData) -> Option<Cmd> {
     let string = |name: &str| {
@@ -154,7 +235,7 @@ fn parse_slash(data: &CommandData) -> Option<Cmd> {
     match data.name.as_str() {
         "login" => Some(Cmd::Login),
         "update" => Some(Cmd::Update),
-        "fm" => Some(Cmd::Fm),
+        "np" => Some(Cmd::Np),
         "wk" => wk(Kind::Artist, false),
         "wkalbum" => wk(Kind::Album, false),
         "wktrack" => wk(Kind::Track, false),
@@ -168,6 +249,20 @@ fn parse_slash(data: &CommandData) -> Option<Cmd> {
         }),
         "help" => Some(Cmd::Help),
         "refreshmembers" => Some(Cmd::RefreshMembers),
+        name if HIST_SLASH.iter().any(|(n, ..)| *n == name) => {
+            let alias = match (name, string("type").as_deref()) {
+                ("discoverydate", Some("album")) => "dda",
+                ("discoverydate", Some("track")) => "ddt",
+                ("lastlistened", Some("album")) => "lla",
+                ("lastlistened", Some("track")) => "llt",
+                _ => name,
+            };
+            let mut rest = string("options").unwrap_or_default();
+            if let Some(CommandOptionValue::User(id)) = data.options.iter().find(|o| o.name == "user").map(|o| &o.value) {
+                rest = format!("<@{id}> {rest}");
+            }
+            parse_text(alias, rest.trim())
+        }
         _ => None,
     }
 }
@@ -177,7 +272,7 @@ fn display_name(user: &User, nick: Option<&str>) -> String {
 }
 
 impl Bot {
-    fn db(&self) -> &Db {
+    pub(crate) fn db(&self) -> &Db {
         &self.ingest.db
     }
 
@@ -250,7 +345,10 @@ impl Bot {
         let (word, rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
         let Some(cmd) = parse_text(&word.to_lowercase(), rest.trim()) else { return Ok(()) };
         // No command text or ids in logs: the command name and a keyed hash are enough to follow a problem.
-        let name = format!("{cmd:?}");
+        let name = match &cmd {
+            Cmd::Hist { cmd, .. } => format!("{cmd:?}"),
+            cmd => format!("{cmd:?}"),
+        };
         let name = name.split([' ', '(', '{']).next().unwrap_or_default();
         tracing::info!(user = %self.db().1.log_id(msg.author.id.get() as i64), cmd = name, "text command");
 
@@ -454,10 +552,10 @@ impl Bot {
                     (n, false) => reply(format!("Updated: {n} new listens.")),
                 })
             }
-            Cmd::Fm => {
+            Cmd::Np => {
                 let (now, updated) = tokio::join!(self.ingest.lb.now_or_last(&user.lb_name), self.ingest.update(&user, crate::lb::Prio::Command));
                 if let Err(e) = updated {
-                    tracing::warn!(error = ?e, "update during fm failed");
+                    tracing::warn!(error = ?e, "update during np failed");
                 }
                 let Some((t, playing, mapping)) = now? else { return Ok(reply("No listens yet.")) };
                 let plays = async {
@@ -489,31 +587,9 @@ impl Bot {
                 if !global && ctx.guild.is_none() {
                     return Ok(reply("Server WhoKnows only works in servers. Use `gw` for global."));
                 }
-                // The playing track's name and mapping, for the cover; empty for a typed query.
-                let mut now = (None, Value::Null);
-                let (artist, name) = match query {
-                    Some(q) => match kind {
-                        Kind::Artist => (q, None),
-                        _ => match q.split_once(" - ") {
-                            Some((a, n)) => (a.trim().to_owned(), Some(n.trim().to_owned())),
-                            None => return Ok(reply("Format: `Artist - Name`")),
-                        },
-                    },
-                    None => {
-                        let Some((t, _, mapping)) = self.ingest.lb.now_or_last(&user.lb_name).await? else {
-                            return Ok(reply("No listens yet."));
-                        };
-                        let name = match kind {
-                            Kind::Artist => None,
-                            Kind::Album => match t.release_name.filter(|a| !a.is_empty()) {
-                                Some(a) => Some(a),
-                                None => return Ok(reply("The playing track has no album.")),
-                            },
-                            Kind::Track => Some(t.track_name.clone()),
-                        };
-                        now = (Some(t.track_name), mapping);
-                        (t.artist_name, name)
-                    }
+                let (artist, name, now) = match self.subject(&user, kind, query).await? {
+                    Ok(s) => s,
+                    Err(e) => return Ok(e),
                 };
                 if let Err(e) = self.ingest.update(&user, crate::lb::Prio::Command).await {
                     tracing::warn!(error = ?e, "update during wk failed");
@@ -557,8 +633,37 @@ impl Bot {
                 self.db().delete_user(user.id).await?;
                 Ok(reply("Your account and all your data were deleted."))
             }
+            Cmd::Hist { cmd, kind, arg } => self.hist(ctx, &user, cmd, kind, &arg, indexing_note).await,
             Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock => unreachable!("handled above"),
         }
+    }
+
+    /// What a command is about: the typed `Artist` or `Artist - Name`, else the playing track's artist, album or track.
+    /// Also the playing track's name and mapping, for the cover (empty for a typed query). `Err` is a reply for the user.
+    pub(crate) async fn subject(&self, user: &crate::db::User, kind: Kind, query: Option<String>) -> Result<Result<Subject, Embed>> {
+        Ok(Ok(match query {
+            Some(q) => match kind {
+                Kind::Artist => (q, None, (None, Value::Null)),
+                _ => match q.split_once(" - ") {
+                    Some((a, n)) => (a.trim().to_owned(), Some(n.trim().to_owned()), (None, Value::Null)),
+                    None => return Ok(Err(reply("Format: `Artist - Name`"))),
+                },
+            },
+            None => {
+                let Some((t, _, mapping)) = self.ingest.lb.now_or_last(&user.lb_name).await? else {
+                    return Ok(Err(reply("No listens yet.")));
+                };
+                let name = match kind {
+                    Kind::Artist => None,
+                    Kind::Album => match t.release_name.filter(|a| !a.is_empty()) {
+                        Some(a) => Some(a),
+                        None => return Ok(Err(reply("The playing track has no album."))),
+                    },
+                    Kind::Track => Some(t.track_name.clone()),
+                };
+                (t.artist_name, name, (Some(t.track_name), mapping))
+            }
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -843,7 +948,7 @@ fn text_value(c: &ModalInteractionComponent) -> Option<String> {
     }
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
         if "*_`~|>[]()\\".contains(c) {
             out.push('\\');
@@ -860,9 +965,12 @@ fn error_reply(e: anyhow::Error) -> Embed {
 
 const HELP: &str = "**Commands** (default prefix `.`; each one also exists as a slash command)
 `/login`: connect your ListenBrainz account (slash only, so the token stays private)
-`.fm`: your current track
+`.np`: your current track
 `.w` `.wa` `.wt`: who listens to an artist / album / track in this server (`Artist - Name`)
 `.gw` `.gwa` `.gwt`: the same across the bot
+`.o`: last days · `.streak` `.streaks` · `.gaps` · `.discoveries` · `.dd` `.ll`: first / last listen
+`.pace` `.apc`: when you'll hit a play count · `.ms`: your nth listen
+`.year` `.recap` `.receipt` `.iceberg` · `.taste @user` · `.aff`: who listens like you here
 `.update`: fetch your latest listens
 `.privacy`: show or hide yourself in global lists
 `.remove`: delete your account and data
@@ -882,6 +990,10 @@ mod tests {
         assert_eq!(parse_text("hello", ""), None);
         assert_eq!(parse_text("featured", "block"), Some(Cmd::FeaturedBlock));
         assert_eq!(parse_text("featured", ""), None);
+        assert_eq!(parse_text("fm", ""), None, "renamed to np");
+        assert_eq!(parse_text("np", ""), Some(Cmd::Np));
+        assert_eq!(parse_text("dda", "a - b"), Some(Cmd::Hist { cmd: Hc::DiscoveryDate, kind: Kind::Album, arg: "a - b".into() }));
+        assert!(matches!(parse_text("o", "3"), Some(Cmd::Hist { cmd: Hc::Overview, .. })));
     }
 
     #[test]
@@ -932,7 +1044,7 @@ mod tests {
 
     #[test]
     fn slash_list_and_escape() {
-        assert_eq!(slash_commands().len(), 14);
+        assert_eq!(slash_commands().len(), 30);
         assert_eq!(escape("a*b_c"), "a\\*b\\_c");
     }
 }

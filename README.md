@@ -13,16 +13,28 @@ The default prefix is `.`, and every command also exists as a slash command.
 | Command | What it does |
 |---|---|
 | `/login` | Connect your ListenBrainz account with your user token. Slash only, so the token stays private. |
-| `.fm` | Your current or last played track |
+| `.np` | Your current or last played track |
 | `.w` `.wa` `.wt` | Who in this server listens to an artist, album or track |
 | `.gw` `.gwa` `.gwt` | The same across everyone on the bot |
+| `.o` | Your last days: plays and top artist, album and track per day (`.o 7`) |
+| `.streak` `.streaks` | Your current streak, and your longest ones |
+| `.gaps` | What you came back to after the longest break |
+| `.discoveries` | Artists you discovered recently |
+| `.dd` `.ll` | When you first / last listened to an artist (`.dda` `.ddt` `.lla` `.llt` for albums and tracks) |
+| `.pace` `.apc` | When you'll reach a play count, overall or for an artist (`.pace 50000`, `.apc 1000 Radiohead`) |
+| `.ms` | Your nth listen (`.ms 10000`) |
+| `.year` `.recap` | Summary of a year or a period |
+| `.receipt` | Your top tracks as a receipt |
+| `.iceberg` | Your top artists by how many ListenBrainz users know them |
+| `.taste @user` | Compare your taste with someone |
+| `.aff` | Who in this server listens most like you |
 | `.update` | Fetch your latest listens |
 | `.privacy` | Show or hide yourself in global lists |
 | `.remove` | Delete your account and data |
 | `/prefix` | Change the server's prefix (needs Manage Server) |
 | `/refreshmembers` | Reload the server's member list (needs Manage Server) |
 
-Without an argument, `.w`, `.wa` and `.wt` use the track you are playing. With one, they take `Artist` or `Artist - Name`.
+Without an argument, `.w`, `.wa` and `.wt` use the track you are playing. With one, they take `Artist` or `Artist - Name`. The same goes for `.dd`, `.ll` and `.apc`. Commands over a period take `week`, `month`, `quarter`, `half`, `year`, `alltime` or a number of days like `90d`; `.streaks`, `.gaps` and `.discoveries` also take `albums` or `tracks`.
 
 After you log in, the bot downloads your full history from ListenBrainz as an export, which can take a few minutes for large accounts, and then deletes your token. From then on it fetches only new listens. If you import or delete older listens on ListenBrainz, `.update` tells you, and `/login` downloads everything again.
 

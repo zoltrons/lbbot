@@ -350,6 +350,52 @@ impl Db {
             .bind(id).bind(user_id).fetch_optional(&self.0).await?.unwrap_or(0))
     }
 
+    /// A user's whole history, oldest first.
+    // shortcut: decodes every chunk on each command (~25 for 100k listens); read only the newest chunks for short periods if this gets slow.
+    pub async fn history(&self, user_id: i32) -> Result<Vec<Entry>> {
+        let chunks: Vec<Vec<u8>> = sqlx::query_scalar("SELECT data FROM history WHERE user_id = $1 ORDER BY seq")
+            .bind(user_id).fetch_all(&self.0).await?;
+        let mut out = Vec::with_capacity(chunks.len() * CHUNK);
+        for c in &chunks {
+            out.extend(history::decode(c)?);
+        }
+        Ok(out)
+    }
+
+    /// The artist of each track.
+    pub async fn track_artists(&self, tracks: &[i32]) -> Result<HashMap<i32, i32>> {
+        Ok(sqlx::query_as("SELECT id, artist_id FROM tracks WHERE id = ANY($1)").bind(tracks).fetch_all(&self.0).await?.into_iter().collect())
+    }
+
+    /// Display names: the artist, or `Artist - Name` for albums and tracks.
+    pub async fn names(&self, kind: Kind, ids: &[i32]) -> Result<HashMap<i32, String>> {
+        let sql = match kind {
+            Kind::Artist => "SELECT id, name FROM artists WHERE id = ANY($1)".to_owned(),
+            _ => format!(
+                "SELECT t.id, a.name || ' - ' || t.name FROM {} t JOIN artists a ON a.id = t.artist_id WHERE t.id = ANY($1)",
+                if kind == Kind::Album { "albums" } else { "tracks" }
+            ),
+        };
+        Ok(sqlx::query_as(AssertSqlSafe(sql)).bind(ids).fetch_all(&self.0).await?.into_iter().collect())
+    }
+
+    /// Server members' plays of the given artists, with their name and total listens: (user id, name, total, artist, plays).
+    /// Reads the counters by artist (their key), since they have no user index.
+    pub async fn member_artist_plays(&self, guild: i64, artists: &[i32]) -> Result<Vec<(i32, String, i64, i32, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT u.id, gm.name, u.listens::bigint, c.artist_id, c.plays::bigint
+             FROM user_artists c JOIN guild_members gm ON gm.user_id = c.user_id AND gm.guild_hash = $1
+             JOIN users u ON u.id = c.user_id WHERE c.artist_id = ANY($2)",
+        )
+        .bind(self.1.id(guild)).bind(artists).fetch_all(&self.0).await?)
+    }
+
+    /// Whether the bot has this registered user in the server's member list.
+    pub async fn is_member(&self, guild: i64, user_id: i32) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM guild_members WHERE guild_hash = $1 AND user_id = $2)")
+            .bind(self.1.id(guild)).bind(user_id).fetch_one(&self.0).await?)
+    }
+
     /// Stores one chunk of a server's members (only users registered with the bot are kept).
     pub async fn add_members(&self, guild: i64, members: &[(i64, String)]) -> Result<()> {
         let (ids, names): (Vec<i64>, Vec<&str>) = members.iter().map(|(i, n)| (self.1.id(*i), n.as_str())).unzip();
@@ -476,6 +522,15 @@ mod tests {
         assert_eq!((rows[0].listeners, rows[0].total), (2, 4));
         let (track, _) = db.find(Kind::Track, "radiohead", Some("CREEP")).await?.unwrap();
         assert_eq!(db.plays(Kind::Track, track, a).await?, 2);
+        // History commands read the blobs back and name what they count.
+        assert_eq!(db.history(a).await?.iter().map(|e| e.ts).collect::<Vec<_>>(), [100, 200, 300]);
+        assert_eq!(db.track_artists(&[track]).await?[&track], artist);
+        assert!(db.names(Kind::Track, &[track]).await?[&track].eq_ignore_ascii_case("Radiohead - Creep"));
+        assert!(db.names(Kind::Artist, &[artist]).await?[&artist].eq_ignore_ascii_case("Radiohead"));
+        let mut plays = db.member_artist_plays(10, &[artist]).await?;
+        plays.sort();
+        assert_eq!(plays, [(a, "Alice".into(), 3, artist, 3), (b, "Bob".into(), 1, artist, 1)]);
+        assert!(db.is_member(10, b).await? && !db.is_member(11, b).await?);
         // A hand-typed query is cleaned the same way as stored listens.
         assert_eq!(db.find(Kind::Track, "Radiohead feat. X", Some("Creep (Remastered)")).await?.map(|r| r.0), Some(track));
         assert_eq!(db.user(a).await?.last_ts, 300);
