@@ -1,5 +1,3 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
-
 # lbbot
 
 lbbot is a Discord bot for [ListenBrainz](https://listenbrainz.org), modeled on [fmbot](https://github.com/fmbot-discord/fmbot). It shows what you are listening to and who else in your server listens to the same artist, album or track.
