@@ -53,6 +53,8 @@ The database test is skipped when `TEST_DATABASE_URL` is not set. Point it at a 
 
 [docs/how-it-works.md](docs/how-it-works.md) explains how history is fetched, how names are matched and how the data is stored.
 
+[PRIVACY.md](PRIVACY.md) lists what the bot stores and how to delete it. [SECURITY.md](SECURITY.md) covers token encryption and how to report a vulnerability.
+
 | Path | Contents |
 |---|---|
 | `src/main.rs` | Startup and gateway shards |
