@@ -79,3 +79,7 @@ The database test is skipped when `TEST_DATABASE_URL` is not set. Point it at a 
 | `src/history.rs` | Compressed history format |
 | `src/crypto.rs` | Token encryption |
 | `migrations/` | Database schema |
+
+## License
+
+lbbot is free software under the [GNU Affero General Public License v3.0](LICENSE) or later. If you run a modified version for other people, for example as a public Discord bot, you have to share its source code under the same license.
