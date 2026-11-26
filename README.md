@@ -16,7 +16,7 @@ The default prefix is `,` (so it doesn't clash with fmbot's `.`), and every comm
 | `,np` | Your current or last played track |
 | `,w` `,wa` `,wt` | Who in this server listens to an artist, album or track |
 | `,gw` `,gwa` `,gwt` | The same across everyone on the bot |
-| `,o` | Your last days: plays and top artist, album and track per day (`,o 7`) |
+| `,o` | Your last four weeks day by day: plays, genres and top artist, album and track, with page buttons |
 | `,streak` `,streaks` | Your current streak, and your longest ones |
 | `,gaps` | What you came back to after the longest break |
 | `,discoveries` | Artists you discovered recently |
@@ -25,7 +25,7 @@ The default prefix is `,` (so it doesn't clash with fmbot's `.`), and every comm
 | `,ms` | Your nth listen (`,ms 10000`) |
 | `,year` `,recap` | Summary of a year or a period |
 | `,receipt` | Your top tracks as a receipt |
-| `,iceberg` | Your top artists by how many ListenBrainz users know them |
+| `,iceberg` | Your top artists drawn on an iceberg, deeper for those fewer ListenBrainz users listen to |
 | `,taste @user` | Compare your taste with someone |
 | `,aff` | Who in this server listens most like you |
 | `,update` | Fetch your latest listens |

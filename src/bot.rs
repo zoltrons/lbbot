@@ -112,6 +112,27 @@ pub(crate) struct Ctx {
     pub name: String,
 }
 
+/// A reply: one embed, plus buttons and files for the commands that have them.
+pub(crate) struct Out {
+    pub embed: Embed,
+    pub components: Vec<Component>,
+    pub files: Vec<twilight_model::http::attachment::Attachment>,
+}
+
+impl From<Embed> for Out {
+    fn from(embed: Embed) -> Self {
+        Self { embed, components: Vec::new(), files: Vec::new() }
+    }
+}
+
+fn failed(e: anyhow::Error) -> Out {
+    error_reply(e).into()
+}
+
+fn login_first() -> Embed {
+    reply(format!("Connect your ListenBrainz account with `/login` first. You'll need your **User token** from {SETTINGS}."))
+}
+
 pub(crate) fn reply(text: impl Into<String>) -> Embed {
     EmbedBuilder::new().color(COLOR).description(text).build()
 }
@@ -206,7 +227,7 @@ pub fn slash_commands() -> Vec<Command> {
 
 /// Slash versions of the history commands: (name, description, hint for the free-text options; empty = none).
 const HIST_SLASH: [(&str, &str, &str); 16] = [
-    ("overview", "Your last days: plays and top artist, album and track per day", "Number of days (1-7)"),
+    ("overview", "Your last days: plays, genres and top artist, album and track per day", ""),
     ("streak", "Your current artist, album and track streak", ""),
     ("streaks", "Your longest streaks", "artists, albums or tracks"),
     ("gaps", "What you came back to after the longest break", "artists, albums or tracks"),
@@ -359,14 +380,20 @@ impl Bot {
         };
         let typing = self.http.create_typing_trigger(msg.channel_id);
         let _ = typing.await;
-        let out = match cmd {
-            Cmd::Login => reply("Use `/login` so your token stays private."),
-            Cmd::Prefix(_) => reply(format!("Prefix: `{prefix}`. Use `/prefix` to change it (needs Manage Server).")),
-            Cmd::RefreshMembers => reply("Use `/refreshmembers` to reload the member list (needs Manage Server)."),
-            Cmd::FeaturedBlock => self.featured_block(&ctx).await.unwrap_or_else(error_reply),
-            cmd => self.run(&ctx, cmd).await.unwrap_or_else(error_reply),
+        let out: Out = match cmd {
+            Cmd::Login => reply("Use `/login` so your token stays private.").into(),
+            Cmd::Prefix(_) => reply(format!("Prefix: `{prefix}`. Use `/prefix` to change it (needs Manage Server).")).into(),
+            Cmd::RefreshMembers => reply("Use `/refreshmembers` to reload the member list (needs Manage Server).").into(),
+            Cmd::FeaturedBlock => self.featured_block(&ctx).await.unwrap_or_else(error_reply).into(),
+            cmd => self.run(&ctx, cmd).await.unwrap_or_else(failed),
         };
-        self.http.create_message(msg.channel_id).embeds(&[out]).reply(msg.id).await?;
+        self.http
+            .create_message(msg.channel_id)
+            .embeds(&[out.embed])
+            .components(&out.components)
+            .attachments(&out.files)
+            .reply(msg.id)
+            .await?;
         Ok(())
     }
 
@@ -425,8 +452,21 @@ impl Bot {
                 }
                 let ephemeral = matches!(cmd, Cmd::Privacy | Cmd::Remove { .. } | Cmd::Prefix(_));
                 self.defer(i, ephemeral).await?;
-                let out = self.run(&ctx, cmd).await.unwrap_or_else(error_reply);
-                client.update_response(&i.token).embeds(Some(&[out])).await?;
+                let out = self.run(&ctx, cmd).await.unwrap_or_else(failed);
+                client.update_response(&i.token).embeds(Some(&[out.embed])).components(Some(&out.components)).attachments(&out.files).await?;
+            }
+            Some(InteractionData::MessageComponent(data)) => {
+                let Some((owner, today, page)) = crate::hist::overview_button(&data.custom_id) else { return Ok(()) };
+                if owner != ctx.discord_id {
+                    let text = "Only the person who ran the command can turn its pages.";
+                    let resp = ChannelMessageBuilder::new().embeds([reply(text)]).flags(MessageFlags::EPHEMERAL).build();
+                    client.create_response(i.id, &i.token, &resp).await?;
+                    return Ok(());
+                }
+                let resp = InteractionResponse { kind: InteractionResponseType::DeferredUpdateMessage, data: None };
+                client.create_response(i.id, &i.token, &resp).await?;
+                let out = self.overview_turn(&ctx, today, page).await.unwrap_or_else(failed);
+                client.update_response(&i.token).embeds(Some(&[out.embed])).components(Some(&out.components)).await?;
             }
             Some(InteractionData::ModalSubmit(data)) if data.custom_id == "login" => {
                 self.defer(i, true).await?;
@@ -510,7 +550,26 @@ impl Bot {
         Ok(reply(escape(&self.featured.block(&self.http, &self.ingest).await?)))
     }
 
-    async fn run(&self, ctx: &Ctx, cmd: Cmd) -> Result<Embed> {
+    async fn run(&self, ctx: &Ctx, cmd: Cmd) -> Result<Out> {
+        match cmd {
+            Cmd::Hist { cmd, kind, arg } => match self.registered(ctx).await? {
+                Some(user) => self.hist(ctx, &user, cmd, kind, &arg).await,
+                None => Ok(login_first().into()),
+            },
+            cmd => Ok(self.run_embed(ctx, cmd).await?.into()),
+        }
+    }
+
+    /// The caller's account, after adding them to this server's member list. `None` = not logged in.
+    pub(crate) async fn registered(&self, ctx: &Ctx) -> Result<Option<crate::db::User>> {
+        let user = self.db().user_by_discord(ctx.discord_id).await?;
+        if let (Some(_), Some(g)) = (&user, ctx.guild) {
+            self.db().add_members(g, &[(ctx.discord_id, ctx.name.clone())]).await?;
+        }
+        Ok(user)
+    }
+
+    async fn run_embed(&self, ctx: &Ctx, cmd: Cmd) -> Result<Embed> {
         if cmd == Cmd::Help {
             return Ok(reply(HELP));
         }
@@ -524,12 +583,7 @@ impl Bot {
             return Ok(reply(format!("The prefix is now `{p}`.")));
         }
 
-        let Some(user) = self.db().user_by_discord(ctx.discord_id).await? else {
-            return Ok(reply(format!("Connect your ListenBrainz account with `/login` first. You'll need your **User token** from {SETTINGS}.")));
-        };
-        if let Some(g) = ctx.guild {
-            self.db().add_members(g, &[(ctx.discord_id, ctx.name.clone())]).await?;
-        }
+        let Some(user) = self.registered(ctx).await? else { return Ok(login_first()) };
         let indexing_note = (!user.indexed).then_some("Your history is still downloading, so counts may be incomplete.");
 
         match cmd {
@@ -568,7 +622,7 @@ impl Bot {
                 let (artist_plays, art) = tokio::join!(plays, art);
                 let artist_plays = artist_plays?;
                 let track = match &art.url {
-                    Some(url) => format!("[{}]({url})", escape(&t.track_name)),
+                    Some(url) => format!("[{}]({url})", link_text(&t.track_name)),
                     None => escape(&t.track_name),
                 };
                 let mut desc = format!("**{track}**\n**{}**", escape(&t.artist_name));
@@ -633,8 +687,7 @@ impl Bot {
                 self.db().delete_user(user.id).await?;
                 Ok(reply("Your account and all your data were deleted."))
             }
-            Cmd::Hist { cmd, kind, arg } => self.hist(ctx, &user, cmd, kind, &arg, indexing_note).await,
-            Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock => unreachable!("handled above"),
+            Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock | Cmd::Hist { .. } => unreachable!("handled above"),
         }
     }
 
@@ -680,7 +733,7 @@ impl Bot {
         note: Option<&str>,
     ) -> EmbedBuilder {
         let row = |rank: String, name: &str, lb_name: &str, plays: i32, me: bool| {
-            let link = format!("[{}]({})", escape(name), crate::lb::profile_url(lb_name));
+            let link = format!("[{}]({})", link_text(name), crate::lb::profile_url(lb_name));
             if me { format!("**{rank} {link}** - **{plays}** plays") } else { format!("{rank} {link} - **{plays}** plays") }
         };
         let crown = has_crown(kind, global, &rows.iter().map(|r| r.plays).collect::<Vec<_>>());
@@ -913,11 +966,11 @@ fn art_keys(kind: Kind, artist: &str, name: &str, mapping: &Value) -> (ArtKey, A
     (mbid.map_or_else(|| name_key.clone(), |m| (kind, m.to_owned(), "mbid".into())), name_key)
 }
 
-fn cache_get(cache: &HashMap<ArtKey, (std::time::Instant, Art)>, key: &ArtKey) -> Option<Art> {
+pub(crate) fn cache_get(cache: &HashMap<ArtKey, (std::time::Instant, Art)>, key: &ArtKey) -> Option<Art> {
     cache.get(key).filter(|(at, _)| at.elapsed() < ART_TTL).map(|(_, art)| art.clone())
 }
 
-fn cache_put(cache: &mut HashMap<ArtKey, (std::time::Instant, Art)>, key: ArtKey, art: Art, at: std::time::Instant) {
+pub(crate) fn cache_put(cache: &mut HashMap<ArtKey, (std::time::Instant, Art)>, key: ArtKey, art: Art, at: std::time::Instant) {
     if cache.len() >= ART_CACHE_MAX {
         cache.retain(|_, (at, _)| at.elapsed() < ART_TTL);
         if cache.len() >= ART_CACHE_MAX {
@@ -946,6 +999,12 @@ fn text_value(c: &ModalInteractionComponent) -> Option<String> {
         ModalInteractionComponent::ActionRow(r) => r.components.iter().find_map(text_value),
         _ => None,
     }
+}
+
+/// Text of a `[text](url)` link. Discord shows backslash escapes there as they are ("Vignette \(Live\)"),
+/// so nothing is escaped; square brackets, which would end the link early, become round ones.
+fn link_text(s: &str) -> String {
+    s.replace('[', "(").replace(']', ")")
 }
 
 pub(crate) fn escape(s: &str) -> String {
@@ -1046,5 +1105,7 @@ mod tests {
     fn slash_list_and_escape() {
         assert_eq!(slash_commands().len(), 30);
         assert_eq!(escape("a*b_c"), "a\\*b\\_c");
+        assert_eq!(link_text("Vignette (Live In Mexico City)"), "Vignette (Live In Mexico City)");
+        assert_eq!(link_text("Song [Remix]"), "Song (Remix)");
     }
 }
