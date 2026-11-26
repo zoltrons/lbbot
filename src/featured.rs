@@ -33,6 +33,19 @@ struct State {
 }
 
 pub async fn run(featured: Arc<Featured>, http: Arc<Client>, ingest: Arc<Ingest>) {
+    // A bot without any avatar gets one right away; otherwise restarts wait for the hour (avatar change limit).
+    match http.current_user().await {
+        Ok(r) => match r.model().await {
+            Ok(me) if me.avatar.is_none() => {
+                if let Err(e) = rotate(&mut *featured.0.lock().await, &http, &ingest).await {
+                    tracing::warn!(error = ?e, "first featured avatar failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = ?e, "couldn't read the bot's avatar"),
+        },
+        Err(e) => tracing::warn!(error = ?e, "couldn't read the bot's avatar"),
+    }
     loop {
         // On the hour, not at startup: frequent restarts would hit Discord's avatar change limit.
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
