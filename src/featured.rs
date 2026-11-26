@@ -20,7 +20,7 @@ const RECENT: usize = 28 * 24;
 /// Users tried per hour before giving up until the next hour.
 const TRIES: usize = 5;
 
-/// Shared with the bot for `.featured block`. One lock, so the hourly change and the command never run at once.
+/// Shared with the bot for `,featured block`. One lock, so the hourly change and the command never run at once.
 #[derive(Default)]
 pub struct Featured(Mutex<State>);
 

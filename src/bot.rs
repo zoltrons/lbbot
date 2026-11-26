@@ -36,7 +36,7 @@ use twilight_util::builder::{
 
 use crate::{db::{Db, Kind}, ingest::Ingest};
 
-const DEFAULT_PREFIX: &str = ".";
+const DEFAULT_PREFIX: &str = ",";
 const SETTINGS: &str = "[listenbrainz.org/settings](https://listenbrainz.org/settings/)";
 pub(crate) const COLOR: u32 = 0x353070;
 
@@ -624,7 +624,7 @@ impl Bot {
                 }))
             }
             Cmd::Remove { confirm: false } => {
-                Ok(reply("All your data will be deleted. To confirm, run `/remove confirm:True` or `.remove confirm`."))
+                Ok(reply("All your data will be deleted. To confirm, run `/remove confirm:True` or `,remove confirm`."))
             }
             Cmd::Remove { confirm: true } => {
                 if self.ingest.is_busy(user.id) {
@@ -963,17 +963,17 @@ fn error_reply(e: anyhow::Error) -> Embed {
     reply("Something went wrong. Try again in a bit.")
 }
 
-const HELP: &str = "**Commands** (default prefix `.`; each one also exists as a slash command)
+const HELP: &str = "**Commands** (default prefix `,`; each one also exists as a slash command)
 `/login`: connect your ListenBrainz account (slash only, so the token stays private)
-`.np`: your current track
-`.w` `.wa` `.wt`: who listens to an artist / album / track in this server (`Artist - Name`)
-`.gw` `.gwa` `.gwt`: the same across the bot
-`.o`: last days · `.streak` `.streaks` · `.gaps` · `.discoveries` · `.dd` `.ll`: first / last listen
-`.pace` `.apc`: when you'll hit a play count · `.ms`: your nth listen
-`.year` `.recap` `.receipt` `.iceberg` · `.taste @user` · `.aff`: who listens like you here
-`.update`: fetch your latest listens
-`.privacy`: show or hide yourself in global lists
-`.remove`: delete your account and data
+`,np`: your current track
+`,w` `,wa` `,wt`: who listens to an artist / album / track in this server (`Artist - Name`)
+`,gw` `,gwa` `,gwt`: the same across the bot
+`,o`: last days · `,streak` `,streaks` · `,gaps` · `,discoveries` · `,dd` `,ll`: first / last listen
+`,pace` `,apc`: when you'll hit a play count · `,ms`: your nth listen
+`,year` `,recap` `,receipt` `,iceberg` · `,taste @user` · `,aff`: who listens like you here
+`,update`: fetch your latest listens
+`,privacy`: show or hide yourself in global lists
+`,remove`: delete your account and data
 `/prefix`: change the server prefix
 `/refreshmembers`: reload the server member list";
 

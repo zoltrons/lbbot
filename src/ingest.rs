@@ -67,7 +67,7 @@ impl Ingest {
     }
 
     async fn index(&self, user_id: i32) -> Result<i32> {
-        // Marked after the claim is taken: if it is cut off, it starts again at boot and on `.update`.
+        // Marked after the claim is taken: if it is cut off, it starts again at boot and on `,update`.
         self.db.mark_unindexed(user_id).await?;
         let user = self.db.user(user_id).await?;
         // Every full index starts from /login, which stores the token until this index finishes.

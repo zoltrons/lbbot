@@ -356,7 +356,7 @@ impl Bot {
 
     /// Only with members of this server: a mention is just an id, and hidden (`/privacy`) users appear only in their own servers.
     async fn taste(&self, user: &User, mine: &Hist, guild: i64, arg: &str) -> Result<Embed> {
-        let Some((id, rest)) = mention(arg) else { return Ok(reply("Mention someone to compare with: `.taste @user`")) };
+        let Some((id, rest)) = mention(arg) else { return Ok(reply("Mention someone to compare with: `,taste @user`")) };
         let other = match self.db().user_by_discord(id).await? {
             Some(o) if self.db().is_member(guild, o.id).await? => o,
             // The same answer either way, so it doesn't tell whether an outsider has an account.
@@ -473,7 +473,7 @@ fn capitalized(s: &str) -> String {
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
-/// A leading goal, only when a name follows it: `.apc 1000 Radiohead`, but `.apc 311` is the artist 311.
+/// A leading goal, only when a name follows it: `,apc 1000 Radiohead`, but `,apc 311` is the artist 311.
 fn goal_and_name(arg: &str) -> (Option<i64>, &str) {
     match arg.split_once(' ').map(|(n, a)| (n.replace(',', "").parse(), a)) {
         Some((Ok(n), a)) => (Some(n), a.trim()),

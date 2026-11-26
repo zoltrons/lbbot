@@ -33,9 +33,9 @@ Server membership and display names come from Discord.
 
 ## Who can see what
 
-People in a server where you are a member and have logged in can see your play counts for an artist, album or track in `.w`, `.wa` and `.wt`, next to your display name in that server.
+People in a server where you are a member and have logged in can see your play counts for an artist, album or track in `,w`, `,wa` and `,wt`, next to your display name in that server.
 
-Anyone using the bot can see your ListenBrainz username and play counts in global lists (`.gw`, `.gwa`, `.gwt`). `/privacy` removes you from global lists. You still appear in lists for servers you are in.
+Anyone using the bot can see your ListenBrainz username and play counts in global lists (`,gw`, `,gwa`, `,gwt`). `/privacy` removes you from global lists. You still appear in lists for servers you are in.
 
 Every hour the bot changes its avatar to an album cover from a random user's recent or top albums. It only picks users who haven't turned on `/privacy` and who listened in the last 30 days. The cover is the only thing shown. Your name isn't.
 
@@ -57,7 +57,7 @@ Downloaded export files are readable only by the bot's own system account and ar
 
 ## Deleting your data
 
-Run `/remove confirm:True` (or `.remove confirm`). The bot deletes your account, your token if it still has it, your listening history, your play counts and your server memberships right away. It refuses while your history is still downloading, because the download would write the data back. Wait for it to finish and try again.
+Run `/remove confirm:True` (or `,remove confirm`). The bot deletes your account, your token if it still has it, your listening history, your play counts and your server memberships right away. It refuses while your history is still downloading, because the download would write the data back. Wait for it to finish and try again.
 
 Logging in with a different ListenBrainz account deletes the history of the previous account.
 

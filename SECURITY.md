@@ -8,7 +8,7 @@ Report security issues privately through [GitHub's vulnerability reporting](http
 
 Users connect with their ListenBrainz user token. The bot needs it once, to request the user's history export, and deletes it when that index finishes. Until then the token is encrypted. It can't be hashed, because a hash can't be turned back into the token. After the first index the bot only reads public listens, which need no token, and metadata lookups use the operator's own `LB_TOKEN`. So the database normally holds no user credentials at all.
 
-- The token is entered in an ephemeral Discord modal, so only the user sees it. The text command `.login` doesn't accept a token and points to `/login`, so tokens don't end up in public channels.
+- The token is entered in an ephemeral Discord modal, so only the user sees it. The text command `,login` doesn't accept a token and points to `/login`, so tokens don't end up in public channels.
 - The bot checks the token with ListenBrainz before storing anything and takes the username from ListenBrainz's answer.
 - Tokens are encrypted with XChaCha20-Poly1305, using the RustCrypto implementation. Every encryption uses a new random 192-bit nonce. The stored value is a format byte, the nonce, and the ciphertext with its authentication tag, so a modified value fails to decrypt instead of producing a wrong token.
 - The owner's hashed Discord id is authenticated together with the token. A token copied into another user's row fails to decrypt.
