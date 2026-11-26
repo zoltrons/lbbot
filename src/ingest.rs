@@ -218,11 +218,22 @@ pub async fn refresh_loop(ingest: Arc<Ingest>) {
                 continue;
             }
         };
-        let mut added = 0;
+        let (mut added, mut failures) = (0, 0);
         for user in &users {
             match ingest.update(user, Prio::Background).await {
-                Ok(n) => added += n.unwrap_or(0),
-                Err(e) => tracing::warn!(user_id = user.id, error = ?e, "refresh failed"),
+                Ok(n) => {
+                    added += n.unwrap_or(0);
+                    failures = 0;
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = user.id, error = ?e, "refresh failed");
+                    failures += 1;
+                    // Several users failing in a row means LB is down; each failure already waited through retries.
+                    if failures == 5 {
+                        tracing::warn!("refresh stopped after 5 failures in a row; trying again at the next slot");
+                        break;
+                    }
+                }
             }
         }
         tracing::info!(users = users.len(), added, "refreshed listens");
