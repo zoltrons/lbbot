@@ -3,6 +3,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
 COPY migrations migrations
+# Fonts for the iceberg picture are compiled into the binary (include_bytes!).
+COPY assets assets
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
