@@ -51,7 +51,7 @@ docker compose up -d
 
 `LB_TOKEN` is your own ListenBrainz user token. ListenBrainz requires a token for the metadata lookups behind the cover images, and the bot uses yours instead of keeping users' tokens.
 
-Keep `TOKEN_KEY` safe. If it is lost, the stored ListenBrainz tokens can't be decrypted and every user has to log in again.
+Keep `TOKEN_KEY` safe and don't change it. The database stores only keyed hashes of Discord ids, so with a different key the bot can't recognize anyone. It refuses to start instead, and a new key means a new database where everyone logs in again.
 
 ## Development
 
@@ -67,7 +67,7 @@ The database test is skipped when `TEST_DATABASE_URL` is not set. Point it at a 
 
 [docs/how-it-works.md](docs/how-it-works.md) explains how history is fetched, how names are matched and how the data is stored.
 
-[PRIVACY.md](PRIVACY.md) lists what the bot stores and how to delete it. [SECURITY.md](SECURITY.md) covers token encryption and how to report a vulnerability.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to send a pull request. [PRIVACY.md](PRIVACY.md) lists what the bot stores and how to delete it. [SECURITY.md](SECURITY.md) covers token encryption and how to report a vulnerability.
 
 | Path | Contents |
 |---|---|
