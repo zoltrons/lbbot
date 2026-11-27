@@ -29,6 +29,17 @@ pub struct User {
     pub listens: i32,
     pub count_offset: i32,
     pub indexed: bool,
+    /// IANA time zone name; `None` = UTC.
+    pub tz: Option<String>,
+}
+
+/// What the stats commands know about a track (see migration 0005).
+#[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
+pub struct TrackFacts {
+    pub mbid: Option<String>,
+    pub length_ms: Option<i32>,
+    /// yyyymmdd; `None` = not looked up yet, 0 = unknown.
+    pub released: Option<i32>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -195,6 +206,7 @@ impl Db {
             }))
             .await?;
         let tracks = self.intern_child("tracks", listens.iter().map(|l| (artist_of(l), l.track_metadata.track_name.as_str()))).await?;
+        self.save_mapping(listens, &artists, &tracks).await?;
 
         Ok(listens
             .iter()
@@ -208,6 +220,126 @@ impl Db {
                 }
             })
             .collect())
+    }
+
+    /// MusicBrainz ids and lengths that came with the listens, for entities that don't have them yet. A track that
+    /// gets its id here is looked up again for its facts (`released` back to NULL).
+    async fn save_mapping(&self, listens: &[Listen], artists: &HashMap<String, i32>, tracks: &HashMap<(i32, String), i32>) -> Result<()> {
+        let mut artist_ids: HashMap<i32, &str> = HashMap::new();
+        let mut track_rows: HashMap<i32, (Option<&str>, Option<i32>)> = HashMap::new();
+        for l in listens {
+            let m = &l.track_metadata;
+            let a = artists[&m.artist_name];
+            if let Some(mbid) = &m.artist_mbid {
+                artist_ids.entry(a).or_insert(mbid);
+            }
+            if m.recording_mbid.is_some() || m.length_ms.is_some() {
+                let row = track_rows.entry(tracks[&(a, m.track_name.clone())]).or_default();
+                row.0 = row.0.or(m.recording_mbid.as_deref());
+                row.1 = row.1.or(m.length_ms);
+            }
+        }
+        if !artist_ids.is_empty() {
+            let (ids, mbids): (Vec<i32>, Vec<&str>) = artist_ids.into_iter().unzip();
+            self.set_artist_mbids(&ids, &mbids).await?;
+        }
+        if track_rows.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i32> = track_rows.keys().copied().collect();
+        let mbids: Vec<Option<&str>> = ids.iter().map(|i| track_rows[i].0).collect();
+        let lengths: Vec<Option<i32>> = ids.iter().map(|i| track_rows[i].1).collect();
+        sqlx::query(
+            "UPDATE tracks t SET mbid = coalesce(t.mbid, x.m::uuid),
+                 released = CASE WHEN t.mbid IS NULL AND x.m IS NOT NULL THEN NULL ELSE t.released END,
+                 length_ms = CASE WHEN coalesce(t.length_ms, 0) = 0 THEN coalesce(x.l, t.length_ms) ELSE t.length_ms END
+             FROM unnest($1::int[], $2::text[], $3::int[]) x(id, m, l)
+             WHERE t.id = x.id AND ((t.mbid IS NULL AND x.m IS NOT NULL) OR (coalesce(t.length_ms, 0) = 0 AND x.l IS NOT NULL))",
+        )
+        .bind(&ids).bind(&mbids).bind(&lengths).execute(&self.0).await?;
+        Ok(())
+    }
+
+    /// Sets the MusicBrainz id of artists that have none.
+    pub async fn set_artist_mbids(&self, ids: &[i32], mbids: &[&str]) -> Result<()> {
+        sqlx::query(
+            "UPDATE artists a SET mbid = x.m::uuid FROM unnest($1::int[], $2::text[]) x(id, m) WHERE a.id = x.id AND a.mbid IS NULL",
+        )
+        .bind(ids).bind(mbids).execute(&self.0).await?;
+        Ok(())
+    }
+
+    pub async fn artist_mbids(&self, ids: &[i32]) -> Result<HashMap<i32, String>> {
+        Ok(sqlx::query_as("SELECT id, mbid::text FROM artists WHERE id = ANY($1) AND mbid IS NOT NULL")
+            .bind(ids).fetch_all(&self.0).await?.into_iter().collect())
+    }
+
+    pub async fn track_facts(&self, ids: &[i32]) -> Result<HashMap<i32, TrackFacts>> {
+        type Row = (i32, Option<String>, Option<i32>, Option<i32>);
+        let rows: Vec<Row> = sqlx::query_as("SELECT id, mbid::text, length_ms, released FROM tracks WHERE id = ANY($1)").bind(ids).fetch_all(&self.0).await?;
+        Ok(rows.into_iter().map(|(id, mbid, length_ms, released)| (id, TrackFacts { mbid, length_ms, released })).collect())
+    }
+
+    /// Results of name lookups for tracks without an id: the id when one was found, else the track is marked as
+    /// looked up (`released` = 0), so it isn't looked up again.
+    pub async fn set_track_mbids(&self, ids: &[i32], mbids: &[Option<String>]) -> Result<()> {
+        sqlx::query(
+            "UPDATE tracks t SET mbid = x.m::uuid, released = CASE WHEN x.m IS NULL THEN 0 END,
+                 length_ms = CASE WHEN x.m IS NULL THEN coalesce(t.length_ms, 0) ELSE t.length_ms END
+             FROM unnest($1::int[], $2::text[]) x(id, m) WHERE t.id = x.id AND t.mbid IS NULL",
+        )
+        .bind(ids).bind(mbids).execute(&self.0).await?;
+        Ok(())
+    }
+
+    /// Facts read from MusicBrainz. A known length from MusicBrainz replaces the player's.
+    pub async fn set_track_facts(&self, ids: &[i32], facts: &[crate::lb::RecordingFacts]) -> Result<()> {
+        let lengths: Vec<i32> = facts.iter().map(|f| f.length_ms).collect();
+        let released: Vec<i32> = facts.iter().map(|f| f.released).collect();
+        sqlx::query(
+            "UPDATE tracks t SET released = x.r, length_ms = CASE WHEN x.l > 0 THEN x.l ELSE coalesce(t.length_ms, 0) END
+             FROM unnest($1::int[], $2::int[], $3::int[]) x(id, l, r) WHERE t.id = x.id",
+        )
+        .bind(ids).bind(&lengths).bind(&released).execute(&self.0).await?;
+        Ok(())
+    }
+
+    /// Each artist's most played track across the bot, the key for a name lookup of the artist.
+    pub async fn artist_top_tracks(&self, artists: &[i32]) -> Result<HashMap<i32, i32>> {
+        Ok(sqlx::query_as(
+            "SELECT DISTINCT ON (t.artist_id) t.artist_id, t.id FROM tracks t JOIN user_tracks c ON c.track_id = t.id
+             WHERE t.artist_id = ANY($1) GROUP BY t.artist_id, t.id ORDER BY t.artist_id, sum(c.plays) DESC, t.id",
+        )
+        .bind(artists).fetch_all(&self.0).await?.into_iter().collect())
+    }
+
+    /// The server's most played artists, from the members' counters: (artist, plays).
+    // shortcut: the counters have no user index, so this reads all of `user_artists`; add one if servers get big.
+    pub async fn server_top_artists(&self, guild: i64, limit: i64) -> Result<Vec<(i32, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT c.artist_id, sum(c.plays)::bigint FROM user_artists c JOIN guild_members gm ON gm.user_id = c.user_id AND gm.guild_hash = $1
+             GROUP BY c.artist_id ORDER BY 2 DESC, 1 LIMIT $2",
+        )
+        .bind(self.1.id(guild)).bind(limit).fetch_all(&self.0).await?)
+    }
+
+    pub async fn set_tz(&self, user_id: i32, tz: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE users SET tz = $2 WHERE id = $1").bind(user_id).bind(tz).execute(&self.0).await?;
+        Ok(())
+    }
+
+    pub async fn set_obscurity(&self, user_id: i32, score: i16) -> Result<()> {
+        sqlx::query("UPDATE users SET obscurity = $2 WHERE id = $1").bind(user_id).bind(score).execute(&self.0).await?;
+        Ok(())
+    }
+
+    /// Server members who ran `,obscurity`, most underground first: (user id, name, score).
+    pub async fn member_obscurity(&self, guild: i64) -> Result<Vec<(i32, String, i16)>> {
+        Ok(sqlx::query_as(
+            "SELECT u.id, gm.name, u.obscurity FROM guild_members gm JOIN users u ON u.id = gm.user_id
+             WHERE gm.guild_hash = $1 AND u.obscurity IS NOT NULL ORDER BY u.obscurity DESC, u.id",
+        )
+        .bind(self.1.id(guild)).fetch_all(&self.0).await?)
     }
 
     async fn intern_child<'a>(
@@ -369,14 +501,18 @@ impl Db {
 
     /// Display names: the artist, or `Artist - Name` for albums and tracks.
     pub async fn names(&self, kind: Kind, ids: &[i32]) -> Result<HashMap<i32, String>> {
-        let sql = match kind {
-            Kind::Artist => "SELECT id, name FROM artists WHERE id = ANY($1)".to_owned(),
-            _ => format!(
-                "SELECT t.id, a.name || ' - ' || t.name FROM {} t JOIN artists a ON a.id = t.artist_id WHERE t.id = ANY($1)",
-                if kind == Kind::Album { "albums" } else { "tracks" }
-            ),
-        };
-        Ok(sqlx::query_as(AssertSqlSafe(sql)).bind(ids).fetch_all(&self.0).await?.into_iter().collect())
+        if kind == Kind::Artist {
+            return Ok(sqlx::query_as("SELECT id, name FROM artists WHERE id = ANY($1)").bind(ids).fetch_all(&self.0).await?.into_iter().collect());
+        }
+        Ok(self.name_parts(kind, ids).await?.into_iter().map(|(id, (artist, name))| (id, format!("{artist} - {name}"))).collect())
+    }
+
+    /// (artist, name) of albums or tracks.
+    pub async fn name_parts(&self, kind: Kind, ids: &[i32]) -> Result<HashMap<i32, (String, String)>> {
+        let table = if kind == Kind::Album { "albums" } else { "tracks" };
+        let sql = format!("SELECT t.id, a.name, t.name FROM {table} t JOIN artists a ON a.id = t.artist_id WHERE t.id = ANY($1)");
+        let rows: Vec<(i32, String, String)> = sqlx::query_as(AssertSqlSafe(sql)).bind(ids).fetch_all(&self.0).await?;
+        Ok(rows.into_iter().map(|(id, artist, name)| (id, (artist, name))).collect())
     }
 
     /// Server members' plays of the given artists, with their name and total listens: (user id, name, total, artist, plays).
@@ -476,7 +612,7 @@ async fn clear_listening_data(tx: &mut Tx<'_>, user_id: i32) -> Result<()> {
     )
     .bind(user_id).bind(&tracks).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM history WHERE user_id = $1").bind(user_id).execute(&mut **tx).await?;
-    sqlx::query("UPDATE users SET listens = 0 WHERE id = $1").bind(user_id).execute(&mut **tx).await?;
+    sqlx::query("UPDATE users SET listens = 0, obscurity = NULL WHERE id = $1").bind(user_id).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -493,6 +629,7 @@ mod tests {
                 artist_name: artist.into(),
                 track_name: track.into(),
                 release_name: album.map(Into::into),
+                ..Default::default()
             },
         }
     }
@@ -550,6 +687,54 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.plays).collect::<Vec<_>>(), [2], "only bob is left, with his two listens");
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM user_tracks WHERE user_id = $1").bind(a).fetch_one(&db.0).await?;
         assert_eq!(left, 0);
+        Ok(())
+    }
+
+    /// Ids and lengths that come with listens are kept; lookups and facts fill in the rest. Needs Postgres.
+    #[tokio::test]
+    async fn mapping_facts_and_settings() -> Result<()> {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else { return Ok(()) };
+        let db = connect(&url, Arc::new(crate::crypto::test_crypto())).await?;
+        // Names are new on every run: the name tables are shared and keep what earlier runs found.
+        let tag = std::process::id();
+        let (mapped_artist, other_artist) = (format!("Mapped {tag}"), format!("Unmapped {tag}"));
+        let u = db.upsert_user(201, "carol", "token-c").await?;
+        db.add_members(210, &[(201, "Carol".into())]).await?;
+        let (artist_mbid, recording_mbid) = ("8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", "e97f805a-ab48-4c52-855e-07049142113d");
+        let mut mapped = listen(100, &mapped_artist, "Song", None);
+        mapped.track_metadata.artist_mbid = Some(artist_mbid.into());
+        mapped.track_metadata.recording_mbid = Some(recording_mbid.into());
+        let mut timed = listen(200, &other_artist, "Tune", None);
+        timed.track_metadata.length_ms = Some(180_000);
+        let listens = [mapped, timed, listen(300, &other_artist, "Tune", None), listen(400, &other_artist, "Other", None)];
+        db.store(u, db.intern(&listens).await?, true).await?;
+
+        let (a, _) = db.find(Kind::Artist, &mapped_artist, None).await?.unwrap();
+        let (o, _) = db.find(Kind::Artist, &other_artist, None).await?.unwrap();
+        let (song, _) = db.find(Kind::Track, &mapped_artist, Some("Song")).await?.unwrap();
+        let (tune, _) = db.find(Kind::Track, &other_artist, Some("Tune")).await?.unwrap();
+        let (lone, _) = db.find(Kind::Track, &other_artist, Some("Other")).await?.unwrap();
+        assert_eq!(db.artist_mbids(&[a, o]).await?, HashMap::from([(a, artist_mbid.to_owned())]));
+        let facts = db.track_facts(&[song, tune, lone]).await?;
+        assert_eq!(facts[&song], TrackFacts { mbid: Some(recording_mbid.into()), length_ms: None, released: None });
+        assert_eq!(facts[&tune], TrackFacts { mbid: None, length_ms: Some(180_000), released: None });
+
+        // A lookup that finds nothing marks the track as looked up; one that finds an id leaves its facts to fetch.
+        let found = "13dd61c7-0000-4000-8000-000000000001";
+        db.set_track_mbids(&[tune, lone], &[None, Some(found.into())]).await?;
+        db.set_track_facts(&[song], &[crate::lb::RecordingFacts { length_ms: 200_000, released: 19_940_822 }]).await?;
+        let facts = db.track_facts(&[song, tune, lone]).await?;
+        assert_eq!(facts[&song], TrackFacts { mbid: Some(recording_mbid.into()), length_ms: Some(200_000), released: Some(19_940_822) });
+        assert_eq!(facts[&tune], TrackFacts { mbid: None, length_ms: Some(180_000), released: Some(0) });
+        assert_eq!(facts[&lone], TrackFacts { mbid: Some(found.into()), length_ms: None, released: None });
+
+        assert_eq!(db.artist_top_tracks(&[o]).await?[&o], tune, "two plays beat one");
+        assert_eq!(db.server_top_artists(210, 5).await?, [(o, 3), (a, 1)]);
+        db.set_tz(u, Some("Europe/Istanbul")).await?;
+        assert_eq!(db.user(u).await?.tz.as_deref(), Some("Europe/Istanbul"));
+        db.set_obscurity(u, 63).await?;
+        assert_eq!(db.member_obscurity(210).await?, [(u, "Carol".to_owned(), 63)]);
+        db.delete_user(u).await?;
         Ok(())
     }
 

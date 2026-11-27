@@ -2,6 +2,7 @@
 //! normal user tokens don't raise the limit, which is 30 requests per 10 s per IP.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -40,12 +41,17 @@ pub struct Listen {
 
 /// Canonical names, so the same song gets the same key for every user (see `From<RawMetadata>`): the main
 /// artist only, the MusicBrainz track title, no feat./remaster/deluxe suffixes. Raw names are not stored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(from = "RawMetadata")]
 pub struct TrackMetadata {
     pub artist_name: String,
     pub track_name: String,
     pub release_name: Option<String>,
+    /// MusicBrainz ids from LB's mapping, only when the name above came from the same mapping.
+    pub artist_mbid: Option<String>,
+    pub recording_mbid: Option<String>,
+    /// Track length the player sent.
+    pub length_ms: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -70,13 +76,31 @@ impl From<RawMetadata> for TrackMetadata {
         let artist = named(&r.mbid_mapping["artists"][0]["artist_credit_name"])
             .or_else(|| named(&r.additional_info["artist_names"][0]))
             .unwrap_or_else(|| r.artist_name.clone());
-        let track = named(&r.mbid_mapping["recording_name"]).unwrap_or(r.track_name);
+        let mapped_track = named(&r.mbid_mapping["recording_name"]);
+        let artist_mbid = named(&r.mbid_mapping["artists"][0]["artist_credit_name"]).and_then(|_| uuid(&r.mbid_mapping["artists"][0]["artist_mbid"]));
+        let recording_mbid = mapped_track.as_ref().and_then(|_| uuid(&r.mbid_mapping["recording_mbid"]));
+        let track = mapped_track.unwrap_or(r.track_name);
+        // Players send `duration_ms`, or `duration` in seconds.
+        let info = &r.additional_info;
+        let ms = info["duration_ms"].as_f64().or_else(|| info["duration"].as_f64().map(|s| s * 1000.0));
         Self {
             artist_name: artist_key(&artist),
             track_name: title_key(&track),
             release_name: r.release_name.map(|a| album_key(&a)),
+            artist_mbid,
+            recording_mbid,
+            length_ms: ms.filter(|ms| (1000.0..=86_400_000.0).contains(ms)).map(|ms| ms as i32),
         }
     }
+}
+
+/// A MusicBrainz id in canonical form, lowercase. Anything else is `None`: one bad id would make Postgres refuse
+/// the whole batch of listens it is stored with.
+pub fn uuid(v: &Value) -> Option<String> {
+    let s = v.as_str()?.to_ascii_lowercase();
+    let ok = s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() });
+    ok.then_some(s)
 }
 
 /// "A feat. B" → "A". `&` and `,` are not split: "Simon & Garfunkel", "Tyler, The Creator".
@@ -462,51 +486,67 @@ impl Lb {
         Ok(body[recording_mbid]["release"].take())
     }
 
-    /// ListenBrainz-wide listener count of each artist, found from one of their tracks: `(artist, track)` in,
-    /// counts out in the same order (`None` when unmatched). At most 50 pairs (LB's bulk lookup limit).
-    pub async fn artist_listeners(&self, pairs: &[(String, String)]) -> Result<Vec<Option<i64>>> {
-        // LB refuses the whole request if one pair is empty or over 250 characters; those stay unmatched.
-        let sent: Vec<usize> = (0..pairs.len())
-            .filter(|&i| {
-                let (a, t) = &pairs[i];
-                !a.is_empty() && !t.is_empty() && a.chars().count() + t.chars().count() <= 250
+    /// MusicBrainz mappings of up to 50 `(artist, track, album)` names in one request, in the same order. `Null` when
+    /// unmatched, or when the match is credited to another artist (a wrong mapping).
+    pub async fn lookup_many(&self, items: &[(&str, &str, Option<&str>)]) -> Result<Vec<Value>> {
+        let len = |s: &str| s.chars().count();
+        // LB refuses the whole request if one item is empty or over 250 characters; a long album is left out, the rest stay unmatched.
+        let sent: Vec<(usize, Value)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, (a, t, _))| !a.is_empty() && !t.is_empty() && len(a) + len(t) <= 250)
+            .map(|(i, &(a, t, album))| {
+                let mut v = serde_json::json!({"artist_name": a, "recording_name": t});
+                if let Some(r) = album.filter(|r| !r.is_empty() && len(a) + len(t) + len(r) <= 250) {
+                    v["release_name"] = r.into();
+                }
+                (i, v)
             })
             .collect();
+        let mut out = vec![Value::Null; items.len()];
         if sent.is_empty() {
-            return Ok(vec![None; pairs.len()]);
+            return Ok(out);
         }
-        let recordings: Vec<Value> =
-            sent.iter().map(|&i| serde_json::json!({"artist_name": pairs[i].0, "recording_name": pairs[i].1})).collect();
+        let recordings: Vec<&Value> = sent.iter().map(|(_, v)| v).collect();
         let req = self
             .http
             .post(self.url(&["1", "metadata", "lookup", ""], &[]))
             .header("Authorization", format!("Token {}", self.service_token))
             .json(&serde_json::json!({ "recordings": recordings }));
-        let found = self.json(req, Prio::Command).await?;
-        // Results keep the request order and carry its `index`; a match credited to another artist (wrong mapping) is dropped.
-        let mut mbids: Vec<Option<String>> = vec![None; pairs.len()];
-        for r in found.as_array().into_iter().flatten() {
-            let (Some(i), Some(mbid), Some(credit)) = (r["index"].as_u64(), r["artist_mbids"][0].as_str(), r["artist_credit_name"].as_str()) else {
-                continue;
-            };
-            let Some(&i) = sent.get(i as usize) else { continue };
-            if credit.to_lowercase().starts_with(&pairs[i].0.to_lowercase()) {
-                mbids[i] = Some(mbid.to_owned());
+        // Results carry the request's `index`.
+        for r in self.json(req, Prio::Command).await?.as_array().into_iter().flatten() {
+            let Some(&(i, _)) = r["index"].as_u64().and_then(|i| sent.get(i as usize)) else { continue };
+            let credit = artist_key(r["artist_credit_name"].as_str().unwrap_or_default()).to_lowercase();
+            if credit.starts_with(&items[i].0.to_lowercase()) {
+                out[i] = r.clone();
             }
         }
-        let known: Vec<&str> = mbids.iter().flatten().map(String::as_str).collect();
-        if known.is_empty() {
-            return Ok(vec![None; pairs.len()]);
-        }
-        let req = self.http.post(self.url(&["1", "popularity", "artist"], &[])).json(&serde_json::json!({ "artist_mbids": known }));
-        let counts = self.json(req, Prio::Command).await?;
-        let by_mbid: std::collections::HashMap<&str, i64> = counts
+        Ok(out)
+    }
+
+    /// Length and first release of up to 1000 recordings, by id. Recordings LB doesn't know are left out.
+    pub async fn recording_facts(&self, mbids: &[&str]) -> Result<HashMap<String, RecordingFacts>> {
+        let req = self
+            .http
+            .post(self.url(&["1", "metadata", "recording", ""], &[]))
+            .header("Authorization", format!("Token {}", self.service_token))
+            .json(&serde_json::json!({ "recording_mbids": mbids, "inc": "release" }));
+        let body = self.json(req, Prio::Command).await?;
+        Ok(body.as_object().into_iter().flatten().map(|(k, v)| (k.to_ascii_lowercase(), RecordingFacts::from(v))).collect())
+    }
+
+    /// LB-wide `(listeners, listens)` of up to 1000 artists or recordings (`entity`: "artist", "recording"), by id.
+    /// Ids LB has no stats for yet are left out.
+    pub async fn popularity(&self, entity: &str, mbids: &[&str]) -> Result<HashMap<String, (i64, i64)>> {
+        let key = format!("{entity}_mbid");
+        let req = self.http.post(self.url(&["1", "popularity", entity], &[])).json(&serde_json::json!({ format!("{key}s"): mbids }));
+        let body = self.json(req, Prio::Command).await?;
+        Ok(body
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|c| Some((c["artist_mbid"].as_str()?, c["total_user_count"].as_i64()?)))
-            .collect();
-        Ok(mbids.iter().map(|m| m.as_deref().and_then(|m| by_mbid.get(m).copied())).collect())
+            .filter_map(|c| Some((c[&key].as_str()?.to_ascii_lowercase(), (c["total_user_count"].as_i64()?, c["total_listen_count"].as_i64()?))))
+            .collect())
     }
 
     /// Cover of the artist's most popular album; LB/MB have no artist photos.
@@ -621,6 +661,32 @@ pub fn cover_url(v: &Value) -> Option<String> {
         (Some(mbid), Some(id)) => Some(format!("https://coverartarchive.org/release/{mbid}/{id}-1200.jpg")),
         _ => v["release_mbid"].as_str().map(|mbid| format!("https://coverartarchive.org/release/{mbid}/front-1200")),
     }
+}
+
+/// What the stats commands read about a recording. 0 = unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RecordingFacts {
+    pub length_ms: i32,
+    /// First release as yyyymmdd, yyyy0000 when only the year is known.
+    pub released: i32,
+}
+
+impl From<&Value> for RecordingFacts {
+    fn from(v: &Value) -> Self {
+        let rec = &v["recording"];
+        let length_ms = rec["length"].as_i64().filter(|l| (1..=86_400_000).contains(l)).unwrap_or(0) as i32;
+        let year = v["release"]["year"].as_i64().filter(|y| (1000..=9999).contains(y)).map_or(0, |y| y as i32 * 10_000);
+        Self { length_ms, released: rec["first_release_date"].as_str().and_then(date_number).unwrap_or(year) }
+    }
+}
+
+/// "1994-08-22" → 19940822, "1994-08" → 19940800, "1994" → 19940000.
+pub fn date_number(s: &str) -> Option<i32> {
+    let mut parts = s.split('-').map(|p| p.parse::<i32>().ok());
+    let y = parts.next()??;
+    let m = parts.next().unwrap_or(Some(0))?;
+    let d = parts.next().unwrap_or(Some(0))?;
+    ((1000..=9999).contains(&y) && (0..=12).contains(&m) && (0..=31).contains(&d)).then_some(y * 10_000 + m * 100 + d)
 }
 
 #[derive(Debug, PartialEq)]
@@ -876,6 +942,51 @@ mod tests {
         assert_eq!(super::title_key("Song - Live"), "Song - Live");
         assert_eq!(super::title_key("(Remastered)"), "(Remastered)");
         assert_eq!(super::album_key("Album [Expanded Edition]"), "Album");
+    }
+
+    #[test]
+    fn mapping_ids_lengths_and_facts() {
+        let meta = |v: serde_json::Value| serde_json::from_value::<super::TrackMetadata>(v).unwrap();
+        let (a, r) = ("8F6BD1E4-fbe1-4f50-aa9b-94c450ec0f11", "e97f805a-ab48-4c52-855e-07049142113d");
+        let m = meta(serde_json::json!({"artist_name": "Portishead", "track_name": "Roads",
+            "mbid_mapping": {"artists": [{"artist_credit_name": "Portishead", "artist_mbid": a}], "recording_name": "Roads", "recording_mbid": r},
+            "additional_info": {"duration_ms": 305_000}}));
+        assert_eq!((m.artist_mbid.as_deref(), m.recording_mbid.as_deref(), m.length_ms), (Some(a.to_lowercase().as_str()), Some(r), Some(305_000)));
+        // Ids only come with names from the same mapping; a broken id or length is dropped, not stored.
+        let m = meta(serde_json::json!({"artist_name": "X", "track_name": "Y", "mbid_mapping": {"recording_mbid": r, "artists": [{"artist_mbid": a}]},
+            "additional_info": {"duration": 200}}));
+        assert_eq!((m.artist_mbid, m.recording_mbid, m.length_ms), (None, None, Some(200_000)));
+        let m = meta(serde_json::json!({"artist_name": "X", "track_name": "Y", "mbid_mapping": {"recording_name": "Y", "recording_mbid": "'; DROP"},
+            "additional_info": {"duration_ms": -5}}));
+        assert_eq!((m.recording_mbid, m.length_ms), (None, None));
+        assert_eq!(super::uuid(&serde_json::json!("e97f805a-ab48-4c52-855e-07049142113")), None, "too short");
+
+        assert_eq!(super::date_number("1994-08-22"), Some(19_940_822));
+        assert_eq!(super::date_number("1994-08"), Some(19_940_800));
+        assert_eq!(super::date_number("1994"), Some(19_940_000));
+        assert_eq!(super::date_number("199x"), None);
+        assert_eq!(super::date_number("1994-13-01"), None);
+        let f = super::RecordingFacts::from(&serde_json::json!({"recording": {"length": 373_133, "first_release_date": "1994-08-22"}, "release": {"year": 1997}}));
+        assert_eq!(f, super::RecordingFacts { length_ms: 373_133, released: 19_940_822 });
+        let f = super::RecordingFacts::from(&serde_json::json!({"recording": {}, "release": {"year": 1997}}));
+        assert_eq!(f, super::RecordingFacts { length_ms: 0, released: 19_970_000 });
+    }
+
+    /// Popularity and facts come back keyed by id; ids LB has no data for are left out.
+    #[tokio::test]
+    async fn popularity_and_facts_by_id() {
+        const POP: &str = r#"[{"recording_mbid": "AA", "total_listen_count": 1000, "total_user_count": 10},
+            {"recording_mbid": "bb", "total_listen_count": null, "total_user_count": null}]"#;
+        const FACTS: &str = r#"{"aa": {"recording": {"length": 1000}, "release": {"year": 2001}}}"#;
+        let (addr, server) = fake_lb(&[(200, 10, POP), (200, 10, FACTS)]).await;
+        let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
+        let pop = lb.popularity("recording", &["aa", "bb"]).await.unwrap();
+        assert_eq!(pop, std::collections::HashMap::from([("aa".to_owned(), (10, 1000))]));
+        let facts = lb.recording_facts(&["aa", "bb"]).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts["aa"], super::RecordingFacts { length_ms: 1000, released: 20_010_000 });
+        let paths: Vec<String> = server.await.unwrap().into_iter().map(|(_, p)| p).collect();
+        assert_eq!(paths, ["/1/popularity/recording", "/1/metadata/recording/"]);
     }
 
     #[test]

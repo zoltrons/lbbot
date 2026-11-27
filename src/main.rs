@@ -1,13 +1,18 @@
 mod bot;
 mod crypto;
 mod db;
+mod draw;
 mod featured;
+mod fun;
+mod graph;
 mod hist;
 mod iceberg;
 mod history;
 mod ingest;
 mod lb;
+mod meta;
 mod stats;
+mod tz;
 
 use std::{env, sync::Arc};
 
@@ -67,6 +72,7 @@ async fn main() -> Result<()> {
         prefixes: Default::default(),
         guild_names: Default::default(),
         art_cache: Default::default(),
+        popularity_cache: Default::default(),
         featured,
         owner,
     });

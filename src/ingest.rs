@@ -305,7 +305,7 @@ mod tests {
         Listen {
             listened_at: ts as f64,
             recording_msid: Some(format!("m{msid}")),
-            track_metadata: TrackMetadata { artist_name: "A".into(), track_name: "T".into(), release_name: None },
+            track_metadata: TrackMetadata { artist_name: "A".into(), track_name: "T".into(), ..Default::default() },
         }
     }
 

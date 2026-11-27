@@ -18,8 +18,10 @@ After login, the bot downloads your ListenBrainz history and keeps:
 - Play counts per artist, album and track.
 - The time of your newest listen, how many listens are stored, and whether your history has finished downloading.
 - Whether you turned on `/privacy`.
+- Your time zone, if you set one with `/timezone`.
+- Your last all-time `,obscurity` score (a number from 0 to 100), if you ran it.
 
-Artist, album and track names go into shared tables that all users point to. Those tables hold names only, with nothing that ties a name to a person.
+Artist, album and track names go into shared tables that all users point to. Those tables hold names and facts about the music (MusicBrainz ids, track lengths, release dates), with nothing that ties them to a person.
 
 For each server where the bot sees you, the bot stores a keyed hash of the server ID, a link to your account, and your display name in that server. It only does this for users who have logged in. Other members of the server are never stored. For servers, it stores the custom prefix if one was set, also under the hashed server ID.
 
@@ -37,11 +39,13 @@ People in a server where you are a member and have logged in can see your play c
 
 Anyone using the bot can see your ListenBrainz username and play counts in global lists (`,gw`, `,gwa`, `,gwt`). `/privacy` removes you from global lists. You still appear in lists for servers you are in.
 
+If you ran `,obscurity` for all time, people in your servers see your score, next to your display name there, when they run it. `,servericeberg` shows a server's top artists summed over its members, without names.
+
 Every hour the bot changes its avatar to an album cover from a random user's recent or top albums. It only picks users who haven't turned on `/privacy` and who listened in the last 30 days. The cover is the only thing shown. Your name isn't.
 
 ## What the bot sends to other services
 
-- ListenBrainz: your username, to read your listens and stats, and your token, only to request your export after `/login`. Track metadata lookups use the bot operator's own token and the names of the tracks, not yours.
+- ListenBrainz: your username, to read your listens and stats, and your token, only to request your export after `/login`. Track metadata lookups use the bot operator's own token and the names or MusicBrainz ids of tracks and artists, not yours. Popularity requests send MusicBrainz ids only.
 - MusicBrainz, the Cover Art Archive, Apple Music (including the iTunes search) and Tidal: artist, album and track names, to find covers, artist photos and tags. These requests contain no information about you.
 - Discord: the bot's replies and its avatar.
 
@@ -59,7 +63,7 @@ Downloaded export files are readable only by the bot's own system account and ar
 
 Run `/remove confirm:True` (or `,remove confirm`). The bot deletes your account, your token if it still has it, your listening history, your play counts and your server memberships right away. It refuses while your history is still downloading, because the download would write the data back. Wait for it to finish and try again.
 
-Logging in with a different ListenBrainz account deletes the history of the previous account.
+Logging in with a different ListenBrainz account deletes the history and the `,obscurity` score of the previous account.
 
 `/remove` doesn't touch logs. The person running the bot has to remove those.
 

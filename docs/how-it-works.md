@@ -40,6 +40,12 @@ Some cases still split or merge wrongly:
 - Two different artists with the same name share one entry. Last.fm has the same problem.
 - Albums are grouped by normalized name, not by MusicBrainz release group, so an album sent under two unrelated names ("II" and "2") stays split.
 
+### MusicBrainz ids
+
+Names stay the key, but some commands need to know which MusicBrainz artist or recording an entry is: `,iceberg` and `,hidden` ask LB how popular it is, `,decades` and `,lt` need release dates and track lengths. When a listen's name comes from LB's mapping, the bot also stores the mapping's id on the artist or track (`artists.mbid`, `tracks.mbid`), if the entry has none yet. The first id wins, so two namesakes that share an entry keep the id of whichever came first. Ids are checked to be well-formed UUIDs before they are stored. A track's length from the player (`additional_info.duration_ms` or `duration`) is kept the same way.
+
+Listens stored before this existed have no ids. A command that needs one looks it up by name with LB's bulk lookup (50 names per request, at most 200 per command, most played first) and stores what it finds. A track LB can't match is marked, so it isn't looked up again. Release dates and lengths come from `/1/metadata/recording` (1000 recordings per request) once per track and are stored in `tracks.released` and `tracks.length_ms` (`src/meta.rs`).
+
 ## Storage
 
 PostgreSQL holds everything (`migrations/0001_init.sql`). The schema is kept small on purpose. It has no foreign keys and no indexes beyond what the queries need.
@@ -51,6 +57,8 @@ The `user_artists`, `user_albums` and `user_tracks` tables hold one play count p
 The `history` table stores each user's full listen list, used by future time-based commands like streaks and discoveries. Listens are packed in chunks of 4096, and each listen is three varints: the time since the previous listen, the track id and the album id. Each chunk is compressed with zstd (`src/history.rs`). This costs about 5 bytes per listen, so a user with 100,000 listens takes about 1.1 MB in total.
 
 The `guild_members` table lists which registered users are in which Discord server, and `guilds` stores custom prefixes.
+
+Artists and tracks also have a MusicBrainz id, and tracks a length and a first release date (migration 0005). These are stored once per entity and shared by all users, so they cost a few bytes per distinct track, not per listen. Users have a time zone and their last `,obscurity` score.
 
 New listens are written in one transaction. The bot rewrites the last history chunk with the new listens appended and adds the new plays to the three counter tables. A listen whose timestamp isn't newer than the newest stored one is dropped, so fetching the same page twice doesn't double the counts. Artist counts are derived from the tracks, so every track play also counts once for that track's artist.
 
@@ -68,6 +76,8 @@ LB allows 30 requests per 10 seconds per IP, and user tokens don't raise that li
 
 MusicBrainz allows one request per second, so its requests wait in a separate queue. When that queue is more than two seconds long, the bot skips the lookup instead of making the command wait.
 
+The stats commands use LB's bulk endpoints, so one request covers 50 name lookups or 1000 ids: a command makes a handful of requests at most.
+
 Cover images, artist photos and tags on the cards come from LB's mapping, MusicBrainz, the Cover Art Archive, and Apple Music or Tidal artist pages. Results are cached in memory for 24 hours, up to 10,000 entries. A lookup that failed halfway isn't cached, so it gets retried on the next command.
 
 ## The bot's avatar
@@ -78,13 +88,30 @@ The bot doesn't post who or what was featured; it only writes it to the log. The
 
 ## History commands
 
-`,o`, `,streak`, `,gaps`, `,discoveries`, `,dd`, `,ll`, `,pace`, `,ms`, `,year`, `,recap`, `,receipt`, `,taste` and `,iceberg` read the user's history blobs, not the counters, since the counter tables have no index by user (`src/hist.rs`, math in `src/stats.rs`). Each command fetches new listens first, decodes the user's chunks and counts in memory. Day boundaries are UTC; dates in replies are Discord timestamps, which each reader sees in their own time zone.
+`,o`, `,streak`, `,gaps`, `,discoveries`, `,dd`, `,ll`, `,pace`, `,ms`, `,year`, `,recap`, `,receipt`, `,taste` and `,iceberg` read the user's history blobs, not the counters, since the counter tables have no index by user (`src/hist.rs`, math in `src/stats.rs`). Each command fetches new listens first, decodes the user's chunks and counts in memory. Dates in replies are Discord timestamps, which each reader sees in their own time zone.
+
+Days, hours and years are counted in the user's time zone. Discord doesn't tell bots a user's time zone, so, as with fmbot's `/localization`, the user picks one with `/timezone`. Its autocomplete suggests the zones of the user's and the server's Discord language first (Europe/Istanbul for Turkish) and searches all IANA zones by city as they type; `,timezone Istanbul` works too. Without one, days are UTC and the footers say so. The time zone database is built into the binary (`jiff` with `tzdb-bundle-always`), since the Docker image has none; summer time is handled (`src/tz.rs`). `,recap` and `,year` also compare the period's plays with the period before it.
 
 `,aff` ranks server members by how much their listening overlaps the user's top 50 artists: for each shared artist, the smaller of the two shares of total listens, summed. It reads the counters by artist, which is their key. `,taste` uses the same score over both users' full histories. It only works in a server and only with members the bot has in that server's list. A mention is just a Discord id, so otherwise anyone could look up the account behind any id, including users who turned on `/privacy`.
 
 `,o` shows the days with listens from the last four weeks, four per page, with ⏮ ◀ ▶ ⏭ buttons. Only the person who ran it can turn the pages; a page turn redraws from the stored history without fetching from ListenBrainz. The genre line is the day's top artist's MusicBrainz tags, cached for a day. When the MusicBrainz queue is busy the line is left out rather than making the command wait.
 
-`,iceberg` sorts the user's top 50 artists by how many ListenBrainz users listened to them, and draws them on an iceberg picture (`src/iceberg.rs`: an SVG rendered to PNG with resvg). Its fonts are built into the binary: Bricolage Grotesque for the name, Inter for the artists and JetBrains Mono for the labels (`assets/fonts`, SIL Open Font License). Names those fonts can't draw, such as Japanese or Chinese ones, fall back to the system fonts; the Docker image installs DejaVu and WenQuanYi Zen Hei for that. fmbot uses Spotify popularity here. The bot finds each artist's MusicBrainz id with one bulk metadata lookup of their most played track, then reads `/1/popularity/artist`. That is two requests per command. Artists the lookup matches to someone else are left out and counted in the footer.
+`,iceberg` sorts the user's top 50 artists by how many ListenBrainz users listened to them, and draws them on an iceberg picture (`src/iceberg.rs`: an SVG rendered to PNG with resvg, `src/draw.rs`). Its fonts are built into the binary: Bricolage Grotesque for the name, Inter for the artists and JetBrains Mono for the labels (`assets/fonts`, SIL Open Font License). Names those fonts can't draw, such as Japanese or Chinese ones, fall back to the system fonts; the Docker image installs DejaVu and WenQuanYi Zen Hei for that. fmbot uses Spotify popularity here. Artist ids come from the database; an artist without one is looked up by its most played track across the bot, and the id is stored. The counts come from `/1/popularity/artist` and are cached in memory for a day, so a repeated iceberg makes no requests. Artists LB can't match are left out and counted in the footer. `,sice` draws the same picture for the server's top 50 artists, summed from the members' counters.
+
+## Stats from Alistral
+
+Some commands port ideas from [Alistral](https://github.com/RustyNova016/Alistral), a ListenBrainz stats CLI (`src/fun.rs`, math in `src/stats.rs`):
+
+- `,od` (overdue): for each track with at least 10 plays, the usual gap is the time since the first play divided by the plays, and the overdue factor is how many of those gaps have passed since the last play. Alistral's overdue radio sorts by the same number.
+- `,comebacks`: what you played in the period after not playing it in the same length of time before, but earlier.
+- `,movers`: your all-time top 50 now against the all-time ranks at the start of the period (Alistral's "all-time changes").
+- `,hidden`: your top 200 tracks scored like Alistral's underrated radio: up to 100 points for your rank (your top track 100, rank 1000 and below 0) plus up to 100 for your share of all ListenBrainz listens of the track, from `/1/popularity/recording`.
+- `,ug` (obscurity): a 0-100 score for your top 50 artists, on a log scale from 100,000 LB listeners (0) to 1 (100), weighted by your plays. An all-time score is stored and ranked among the server's members who ran it.
+- `,otd` (on this day): the same date in earlier years, and tracks from your top 300 first released on it.
+- `,obsessions`: each track's biggest day, and artists with 80% of their plays on one track.
+- `,lt` (listening time): plays times track length. Plays of tracks without a known length count as the average known length, and the footer says how many plays had one.
+- `,growth`, `,decades` and `,clock` are pictures (`src/graph.rs`): plays per year or per month of a year (optionally one artist), plays by the decade your 500 most played tracks came out, and plays by weekday and hour.
+- `,unlinked`: your top 100 tracks LB can't match to MusicBrainz, which the id-based commands skip, with a pointer to LB's page for linking listens.
 
 ## Deleting data
 

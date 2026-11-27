@@ -8,9 +8,9 @@ use twilight_gateway::{Event, MessageSender};
 use twilight_http::Client;
 use twilight_model::{
     application::{
-        command::{Command, CommandType},
+        command::{Command, CommandOptionChoice, CommandOptionChoiceValue, CommandType},
         interaction::{
-            Interaction, InteractionData,
+            Interaction, InteractionData, InteractionType,
             application_command::{CommandData, CommandOptionValue},
             modal::ModalInteractionComponent,
         },
@@ -49,6 +49,8 @@ pub struct Bot {
     pub guild_names: RwLock<HashMap<i64, String>>,
     /// Card image/tag cache, so popular artists don't fill the MusicBrainz queue.
     pub art_cache: std::sync::Mutex<HashMap<ArtKey, (std::time::Instant, Art)>>,
+    /// LB popularity by (entity, mbid): `None` = LB has no stats for it yet (see `meta`).
+    pub popularity_cache: std::sync::Mutex<PopularityCache>,
     pub featured: Arc<crate::featured::Featured>,
     /// Discord id of the application owner, for owner-only commands.
     pub owner: Option<i64>,
@@ -56,6 +58,8 @@ pub struct Bot {
 
 /// (artist, album or track name, (playing track name, its mapping))
 pub(crate) type Subject = (String, Option<String>, (Option<String>, Value));
+
+pub type PopularityCache = HashMap<(&'static str, String), (std::time::Instant, Option<(i64, i64)>)>;
 
 /// (kind, lowercase artist, lowercase album/track)
 pub type ArtKey = (Kind, String, String);
@@ -66,6 +70,7 @@ pub struct Art {
     pub tags: Option<String>,
     pub url: Option<String>,
 }
+/// For each in-memory cache: card images and tags, popularity.
 const ART_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const ART_CACHE_MAX: usize = 10_000;
 
@@ -80,6 +85,8 @@ enum Cmd {
     Remove { confirm: bool },
     Help,
     RefreshMembers,
+    /// Show (`None`) or set the time zone the history commands use.
+    Timezone(Option<String>),
     /// Owner only, text only: ban the current avatar's album and pick another one.
     FeaturedBlock,
     /// Commands computed from the stored history; `arg` is the rest of the text, parsed by each command.
@@ -104,6 +111,19 @@ pub(crate) enum Hc {
     Affinity,
     Iceberg,
     Receipt,
+    Overdue,
+    Comebacks,
+    OnThisDay,
+    Movers,
+    Growth,
+    Obsessions,
+    Hidden,
+    Obscurity,
+    ServerIceberg,
+    Decades,
+    ListeningTime,
+    Clock,
+    Unlinked,
 }
 
 pub(crate) struct Ctx {
@@ -163,6 +183,20 @@ fn parse_text(word: &str, rest: &str) -> Option<Cmd> {
         "affinity" | "aff" | "neighbors" | "n" => hist(Hc::Affinity, Kind::Artist),
         "iceberg" | "ice" | "icebergify" | "berg" => hist(Hc::Iceberg, Kind::Artist),
         "receipt" | "rcpt" | "receiptify" => hist(Hc::Receipt, Kind::Artist),
+        "overdue" | "od" | "missed" => hist(Hc::Overdue, Kind::Track),
+        "comebacks" | "comeback" | "returns" => hist(Hc::Comebacks, Kind::Artist),
+        "onthisday" | "otd" | "today" => hist(Hc::OnThisDay, Kind::Artist),
+        "movers" | "climbers" | "mv" => hist(Hc::Movers, Kind::Artist),
+        "growth" | "gr" | "listenchart" => hist(Hc::Growth, Kind::Artist),
+        "obsessions" | "obsession" | "binges" => hist(Hc::Obsessions, Kind::Track),
+        "hidden" | "gems" | "underrated" => hist(Hc::Hidden, Kind::Track),
+        "obscurity" | "underground" | "ug" => hist(Hc::Obscurity, Kind::Artist),
+        "servericeberg" | "sice" | "serverberg" => hist(Hc::ServerIceberg, Kind::Artist),
+        "decades" | "decade" | "eras" => hist(Hc::Decades, Kind::Track),
+        "listeningtime" | "lt" | "playtime" => hist(Hc::ListeningTime, Kind::Artist),
+        "clock" | "hours" | "when" => hist(Hc::Clock, Kind::Artist),
+        "unlinked" | "unmapped" => hist(Hc::Unlinked, Kind::Track),
+        "timezone" | "tz" | "settimezone" => Some(Cmd::Timezone(query.clone())),
         "login" | "set" | "setusername" | "connect" => Some(Cmd::Login),
         "update" | "u" => Some(Cmd::Update),
         "np" | "nowplaying" => Some(Cmd::Np),
@@ -207,6 +241,9 @@ pub fn slash_commands() -> Vec<Command> {
         cmd("refreshmembers", "Reload this server's member list from Discord")
             .default_member_permissions(Permissions::MANAGE_GUILD)
             .build(),
+        cmd("timezone", "Set the time zone your days and hours are counted in")
+            .option(StringBuilder::new("zone", "City or time zone, e.g. Istanbul").required(false).autocomplete(true))
+            .build(),
     ];
     for (name, desc, hint) in HIST_SLASH {
         let mut c = cmd(name, desc);
@@ -226,7 +263,7 @@ pub fn slash_commands() -> Vec<Command> {
 }
 
 /// Slash versions of the history commands: (name, description, hint for the free-text options; empty = none).
-const HIST_SLASH: [(&str, &str, &str); 16] = [
+const HIST_SLASH: [(&str, &str, &str); 29] = [
     ("overview", "Your last days: plays, genres and top artist, album and track per day", ""),
     ("streak", "Your current artist, album and track streak", ""),
     ("streaks", "Your longest streaks", "artists, albums or tracks"),
@@ -243,6 +280,19 @@ const HIST_SLASH: [(&str, &str, &str); 16] = [
     ("affinity", "Who in this server listens most like you", ""),
     ("iceberg", "Your artists by how known they are on ListenBrainz", "Period (week, month, year…)"),
     ("receipt", "Your top tracks as a receipt", "Period (week, month, year…)"),
+    ("overdue", "What you used to play often and haven't lately", "artists, albums or tracks"),
+    ("comebacks", "What you came back to after a break", "Period (week, month, year…) and artists/albums/tracks"),
+    ("onthisday", "This day in earlier years, and songs released on it", ""),
+    ("movers", "What climbed your all-time top", "Period (week, month, year…) and artists/albums/tracks"),
+    ("growth", "Your plays per year, or per month of a year, as a chart", "Year, or an artist"),
+    ("obsessions", "Your biggest days with one song, and one-song artists", ""),
+    ("hidden", "Tracks you play that few others on ListenBrainz do", "Period (week, month, year…)"),
+    ("obscurity", "How underground your artists are, and who here is most", "Period (week, month, year…)"),
+    ("servericeberg", "This server's top artists by how known they are", ""),
+    ("decades", "When the music you play came out, as a chart", "Period (week, month, year…)"),
+    ("listeningtime", "How long you listened, by track lengths", "Period (week, month, year…)"),
+    ("clock", "When you listen: weekday and hour, as a chart", "Period (week, month, year…)"),
+    ("unlinked", "Your top tracks ListenBrainz can't match to MusicBrainz", ""),
 ];
 
 fn parse_slash(data: &CommandData) -> Option<Cmd> {
@@ -270,6 +320,7 @@ fn parse_slash(data: &CommandData) -> Option<Cmd> {
         }),
         "help" => Some(Cmd::Help),
         "refreshmembers" => Some(Cmd::RefreshMembers),
+        "timezone" => Some(Cmd::Timezone(string("zone"))),
         name if HIST_SLASH.iter().any(|(n, ..)| *n == name) => {
             let alias = match (name, string("type").as_deref()) {
                 ("discoverydate", Some("album")) => "dda",
@@ -406,6 +457,21 @@ impl Bot {
         };
         let client = self.http.interaction(self.app_id);
         match &i.data {
+            Some(InteractionData::ApplicationCommand(data)) if i.kind == InteractionType::ApplicationCommandAutocomplete => {
+                // Only `/timezone zone:` autocompletes: matches of what was typed, else the zones of the user's language.
+                let typed = data.options.iter().find_map(|o| match &o.value {
+                    CommandOptionValue::Focused(v, _) => Some(v.as_str()),
+                    _ => None,
+                });
+                let locales: Vec<&str> = [i.locale.as_deref(), i.guild_locale.as_deref()].into_iter().flatten().collect();
+                let choices = crate::tz::suggest(typed.unwrap_or_default(), &locales)
+                    .into_iter()
+                    .map(|zone| CommandOptionChoice { name: crate::tz::label(&zone), name_localizations: None, value: CommandOptionChoiceValue::String(zone) })
+                    .collect();
+                let data = InteractionResponseData { choices: Some(choices), ..Default::default() };
+                let resp = InteractionResponse { kind: InteractionResponseType::ApplicationCommandAutocompleteResult, data: Some(data) };
+                client.create_response(i.id, &i.token, &resp).await?;
+            }
             Some(InteractionData::ApplicationCommand(data)) => {
                 let Some(cmd) = parse_slash(data) else { return Ok(()) };
                 if cmd == Cmd::RefreshMembers {
@@ -587,6 +653,27 @@ impl Bot {
         let indexing_note = (!user.indexed).then_some("Your history is still downloading, so counts may be incomplete.");
 
         match cmd {
+            Cmd::Timezone(None) => {
+                let current = crate::tz::Tz::new(user.tz.as_deref());
+                let text = if current.is_set() {
+                    format!("Your days and hours are counted in **{}**. Change it with `/timezone`.", crate::tz::label(current.name()))
+                } else {
+                    "Your days and hours are counted in **UTC**. Set your time zone with `/timezone`, which suggests yours, or `,timezone Istanbul`.".to_owned()
+                };
+                Ok(reply(text))
+            }
+            Cmd::Timezone(Some(query)) => match crate::tz::find(&query) {
+                Some(zone) => {
+                    // UTC is the default, so it is stored as nothing.
+                    self.db().set_tz(user.id, (zone != "UTC").then_some(zone.as_str())).await?;
+                    Ok(reply(format!("Your time zone is now **{}**.", crate::tz::label(&zone))))
+                }
+                None => {
+                    let close: Vec<String> = crate::tz::suggest(&query, &[]).into_iter().take(5).map(|z| format!("`{z}`")).collect();
+                    let hint = if close.is_empty() { "Try a city, e.g. `Istanbul` or `New York`.".to_owned() } else { format!("Did you mean {}?", close.join(", ")) };
+                    Ok(reply(format!("I don't know that time zone. {hint}")))
+                }
+            },
             Cmd::Update => {
                 if self.ingest.is_busy(user.id) {
                     return Ok(reply("Your history is downloading now. It will be up to date when it finishes."));
@@ -966,11 +1053,11 @@ fn art_keys(kind: Kind, artist: &str, name: &str, mapping: &Value) -> (ArtKey, A
     (mbid.map_or_else(|| name_key.clone(), |m| (kind, m.to_owned(), "mbid".into())), name_key)
 }
 
-pub(crate) fn cache_get(cache: &HashMap<ArtKey, (std::time::Instant, Art)>, key: &ArtKey) -> Option<Art> {
+pub(crate) fn cache_get<K: Eq + std::hash::Hash, V: Clone>(cache: &HashMap<K, (std::time::Instant, V)>, key: &K) -> Option<V> {
     cache.get(key).filter(|(at, _)| at.elapsed() < ART_TTL).map(|(_, art)| art.clone())
 }
 
-pub(crate) fn cache_put(cache: &mut HashMap<ArtKey, (std::time::Instant, Art)>, key: ArtKey, art: Art, at: std::time::Instant) {
+pub(crate) fn cache_put<K: Eq + std::hash::Hash, V>(cache: &mut HashMap<K, (std::time::Instant, V)>, key: K, art: V, at: std::time::Instant) {
     if cache.len() >= ART_CACHE_MAX {
         cache.retain(|_, (at, _)| at.elapsed() < ART_TTL);
         if cache.len() >= ART_CACHE_MAX {
@@ -1030,6 +1117,9 @@ const HELP: &str = "**Commands** (default prefix `,`; each one also exists as a 
 `,o`: last days · `,streak` `,streaks` · `,gaps` · `,discoveries` · `,dd` `,ll`: first / last listen
 `,pace` `,apc`: when you'll hit a play count · `,ms`: your nth listen
 `,year` `,recap` `,receipt` `,iceberg` · `,taste @user` · `,aff`: who listens like you here
+`,od`: overdue favorites · `,comebacks` · `,movers` · `,otd`: on this day · `,obsessions`
+`,growth` `,decades` `,clock`: charts · `,lt`: listening time · `,hidden` · `,ug`: how underground · `,sice` · `,unlinked`
+`,timezone`: the time zone your days are counted in
 `,update`: fetch your latest listens
 `,privacy`: show or hide yourself in global lists
 `,remove`: delete your account and data
@@ -1053,6 +1143,10 @@ mod tests {
         assert_eq!(parse_text("np", ""), Some(Cmd::Np));
         assert_eq!(parse_text("dda", "a - b"), Some(Cmd::Hist { cmd: Hc::DiscoveryDate, kind: Kind::Album, arg: "a - b".into() }));
         assert!(matches!(parse_text("o", "3"), Some(Cmd::Hist { cmd: Hc::Overview, .. })));
+        assert_eq!(parse_text("tz", "New York"), Some(Cmd::Timezone(Some("New York".into()))));
+        assert_eq!(parse_text("timezone", ""), Some(Cmd::Timezone(None)));
+        assert!(matches!(parse_text("od", ""), Some(Cmd::Hist { cmd: Hc::Overdue, kind: Kind::Track, .. })));
+        assert!(matches!(parse_text("sice", ""), Some(Cmd::Hist { cmd: Hc::ServerIceberg, .. })));
     }
 
     #[test]
@@ -1103,7 +1197,7 @@ mod tests {
 
     #[test]
     fn slash_list_and_escape() {
-        assert_eq!(slash_commands().len(), 30);
+        assert_eq!(slash_commands().len(), 44);
         assert_eq!(escape("a*b_c"), "a\\*b\\_c");
         assert_eq!(link_text("Vignette (Live In Mexico City)"), "Vignette (Live In Mexico City)");
         assert_eq!(link_text("Song [Remix]"), "Song (Remix)");
