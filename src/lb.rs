@@ -518,10 +518,12 @@ impl Lb {
             let Some(&(i, _)) = r["index"].as_u64().and_then(|i| sent.get(i as usize)) else { continue };
             let credit = artist_key(r["artist_credit_name"].as_str().unwrap_or_default()).to_lowercase();
             let name = items[i].0.to_lowercase();
-            // The whole credit, or the first of several credited artists: "Eden & X" is Eden's; "Edenbridge",
-            // "Eden Project" and "Florence and the Machine" (one artist each) aren't Eden's or Florence's.
+            // The whole credit, or the first of several credited artists followed by a separator: "Eden & X" is
+            // Eden's and "Earth, Wind & Fire with X" is theirs; "Edenbridge", "Eden Project" and "Florence and the
+            // Machine" (one artist each) aren't Eden's or Florence's.
             let several = r["artist_mbids"].as_array().is_some_and(|a| a.len() > 1);
-            if credit == name || (several && main_artist(&credit) == name) {
+            let first = |rest: &str| SEPARATORS.iter().any(|s| rest.starts_with(s));
+            if credit == name || (several && credit.strip_prefix(&name).is_some_and(first)) {
                 out[i] = r.clone();
             }
         }
@@ -635,8 +637,6 @@ pub fn search_url(search_type: &str, term: &str) -> String {
 
 /// Main (first) artist of a multi-artist credit: "A feat. B", "A & B", "A, B", "A x B" → "A". Unchanged without a separator.
 pub fn main_artist(credit: &str) -> &str {
-    const SEPARATORS: [&str; 12] =
-        [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " & ", ", ", " x ", " and ", " with ", " vs. ", " + "];
     // ASCII lowercasing keeps byte positions, so the cut point is valid in the original too.
     let lower = credit.to_ascii_lowercase();
     match SEPARATORS.iter().filter_map(|s| lower.find(s)).min() {
@@ -644,6 +644,9 @@ pub fn main_artist(credit: &str) -> &str {
         Some(i) => credit[..i].trim(),
     }
 }
+
+/// What joins artists in a credit, lowercase.
+const SEPARATORS: [&str; 12] = [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " & ", ", ", " x ", " and ", " with ", " vs. ", " + "];
 
 /// Quoted phrase for a Lucene query.
 pub fn phrase(s: &str) -> String {
@@ -985,7 +988,9 @@ pub(crate) mod tests {
             {"index": 2, "artist_credit_name": "eden", "artist_mbids": ["z"], "recording_mbid": "r2"},
             {"index": 3, "artist_credit_name": "Eden Project", "artist_mbids": ["p"], "recording_mbid": "r3"},
             {"index": 4, "artist_credit_name": "Florence and the Machine", "artist_mbids": ["f"], "recording_mbid": "r4"},
-            {"index": 5, "artist_credit_name": "Simon & Garfunkel", "artist_mbids": ["s"], "recording_mbid": "r5"}]"#;
+            {"index": 5, "artist_credit_name": "Simon & Garfunkel", "artist_mbids": ["s"], "recording_mbid": "r5"},
+            {"index": 6, "artist_credit_name": "Earth, Wind & Fire with The Emotions", "artist_mbids": ["e", "e2"], "recording_mbid": "r6"},
+            {"index": 7, "artist_credit_name": "Eden Project & Someone", "artist_mbids": ["q", "q2"], "recording_mbid": "r7"}]"#;
         let (addr, server) = fake_lb(&[(200, 10, FOUND)]).await;
         let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
         let items = [
@@ -995,9 +1000,11 @@ pub(crate) mod tests {
             ("Eden", "Gravity", None),
             ("Florence", "Dog Days", None),
             ("Simon & Garfunkel", "The Boxer", None),
+            ("Earth, Wind & Fire", "Boogie Wonderland", None),
+            ("Eden", "Together", None),
         ];
         let found = lb.lookup_many(&items).await.unwrap();
-        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2"), None, None, Some("r5")]);
+        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2"), None, None, Some("r5"), Some("r6"), None]);
         server.await.unwrap();
     }
 
