@@ -463,7 +463,7 @@ impl Bot {
         if let Err(e) = self.ingest.update(&user, Prio::Command).await {
             tracing::warn!(error = ?e, "update during chart failed");
         }
-        let h = self.load(user.id).await?;
+        let h = self.load(&user).await?;
         let from = c.days.map_or(i64::MIN, |d| now() - d * DAY);
         let slice: Vec<Entry> = stats::range(&h.entries, from, i64::MAX)
             .iter()
@@ -496,6 +496,11 @@ impl Bot {
             };
             let items: Vec<(&str, &str, Option<&str>)> = chunk.iter().map(|(k, _)| names(k)).collect();
             let found = lb.lookup_many(&items).await?;
+            // What the lookup found also serves the stats and cards (see `meta`); storing it can't stop the chart.
+            let looked_up: Vec<i32> = chunk.iter().map(|(k, _)| best[k].0).collect();
+            if let Err(e) = self.save_found(&looked_up, &found).await {
+                tracing::warn!(error = ?e, "storing a chart's lookups failed");
+            }
             let recordings: Vec<&str> = found.iter().filter_map(|m| m["recording_mbid"].as_str()).collect();
             let releases = lb.recording_releases(&recordings).await?;
             let release = |m: &Value| m["recording_mbid"].as_str().and_then(|r| releases.get(r)).cloned().unwrap_or_default();

@@ -21,13 +21,15 @@ use crate::{
     history::Entry,
     lb::Prio,
     stats::{self, DAY},
+    tz::Tz,
 };
 
-/// A user's history with each track's artist, so any kind can be counted.
+/// A user's history with each track's artist, so any kind can be counted, and the time zone their days are in.
 pub(crate) struct Hist {
     pub entries: Vec<Entry>,
     /// The artist of each track.
     pub artist: HashMap<i32, i32>,
+    pub tz: Tz,
 }
 
 impl Hist {
@@ -38,18 +40,33 @@ impl Hist {
             Kind::Track => Some(e.track),
         }
     }
+
+    /// Today's local day number.
+    pub(crate) fn today(&self) -> i64 {
+        self.tz.day(now())
+    }
+
+    /// The listens of local day `day`.
+    pub(crate) fn day(&self, day: i64) -> &[Entry] {
+        stats::range(&self.entries, self.tz.start(day), self.tz.start(day + 1))
+    }
+
+    /// Footer line for commands that count by day or hour.
+    pub(crate) fn tz_note(&self) -> String {
+        if self.tz.is_set() { format!("Days are {}", self.tz.name()) } else { "Days are UTC · set your time zone with /timezone".to_owned() }
+    }
 }
 
 /// Words a command can take in any order: a period, a kind, a number; the rest is a name.
 #[derive(Debug, Default, PartialEq)]
-struct Opts {
-    period: Option<(Option<i64>, String)>,
-    kind: Option<Kind>,
-    number: Option<i64>,
-    rest: String,
+pub(crate) struct Opts {
+    pub period: Option<(Option<i64>, String)>,
+    pub kind: Option<Kind>,
+    pub number: Option<i64>,
+    pub rest: String,
 }
 
-fn opts(arg: &str) -> Opts {
+pub(crate) fn opts(arg: &str) -> Opts {
     let mut o = Opts::default();
     let mut rest = Vec::new();
     for w in arg.split_whitespace() {
@@ -122,23 +139,19 @@ pub(crate) fn with_note(mut embed: Embed, note: Option<&str>) -> Embed {
     embed
 }
 
-fn today() -> i64 {
-    now().div_euclid(DAY)
-}
-
 pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn date(ts: i64) -> String {
+pub(crate) fn date(ts: i64) -> String {
     format!("<t:{ts}:D>")
 }
 
-fn ago(ts: i64) -> String {
+pub(crate) fn ago(ts: i64) -> String {
     format!("<t:{ts}:R>")
 }
 
-fn days(secs: i64) -> String {
+pub(crate) fn days(secs: i64) -> String {
     match secs / DAY {
         0 => "less than a day".to_owned(),
         1 => "1 day".to_owned(),
@@ -146,8 +159,8 @@ fn days(secs: i64) -> String {
     }
 }
 
-/// "Mon 25 Nov 2026" for a UTC day number; field names don't render Discord timestamps.
-fn day_label(day: i64) -> String {
+/// "Mon 25 Nov 2026" for a day number; field names don't render Discord timestamps.
+pub(crate) fn day_label(day: i64) -> String {
     const WEEK: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let (y, m, d) = stats::civil(day);
@@ -174,13 +187,13 @@ pub(crate) fn kind_word(kind: Kind) -> &'static str {
 }
 
 /// `1\.` so Discord doesn't turn the lines into a Markdown list.
-fn numbered(lines: impl IntoIterator<Item = String>) -> String {
+pub(crate) fn numbered(lines: impl IntoIterator<Item = String>) -> String {
     let lines: Vec<String> = lines.into_iter().enumerate().map(|(i, l)| format!("{}\\. {l}", i + 1)).collect();
     if lines.is_empty() { "Nothing yet.".to_owned() } else { lines.join("\n") }
 }
 
 /// From the period words: (start, label); `default_days` when none was given, `None` = all time.
-fn since(o: &Opts, default_days: Option<i64>, default_label: &str) -> (i64, String) {
+pub(crate) fn since(o: &Opts, default_days: Option<i64>, default_label: &str) -> (i64, String) {
     let (d, label) = o.period.clone().unwrap_or((default_days, default_label.to_owned()));
     (d.map_or(i64::MIN, |d| now() - d * DAY), label)
 }
@@ -188,13 +201,20 @@ fn since(o: &Opts, default_days: Option<i64>, default_label: &str) -> (i64, Stri
 impl Bot {
     pub(crate) async fn hist(&self, ctx: &Ctx, user: &User, cmd: Hc, kind: Kind, arg: &str) -> Result<Out> {
         let note = (!user.indexed).then_some("Your history is still downloading, so counts may be incomplete.");
+        // The server iceberg reads the members' counters, not this user's history.
+        if cmd == Hc::ServerIceberg {
+            return match ctx.guild {
+                Some(g) => self.server_iceberg(g, note).await,
+                None => Ok(reply("The server iceberg only works in servers.").into()),
+            };
+        }
         if let Err(e) = self.ingest.update(user, Prio::Command).await {
             tracing::warn!(error = ?e, "update during history command failed");
         }
-        let h = self.load(user.id).await?;
+        let h = self.load(user).await?;
         let o = opts(arg);
         let out = match cmd {
-            Hc::Overview => return self.overview(ctx, &h, today(), 0, note).await,
+            Hc::Overview => return self.overview(ctx, &h, h.today(), 0, note).await,
             Hc::Streak => self.streak(&h).await?,
             Hc::Streaks => {
                 let kind = o.kind.unwrap_or(Kind::Artist);
@@ -266,21 +286,32 @@ impl Bot {
                 }
             }
             Hc::Year => {
-                let this = stats::civil(now().div_euclid(DAY)).0;
+                let this = stats::civil(h.today()).0;
                 let year = o.number.filter(|y| (1970..=this).contains(y)).unwrap_or(this);
-                let (from, to) = (stats::year_start(year), stats::year_start(year + 1));
-                let before = stats::range(&h.entries, stats::year_start(year - 1), from).len();
-                let mut e = self.summary(&h, from, to, format!("{year} in music")).await?;
+                let start = |y: i64| h.tz.start(stats::days_from_civil(y, 1, 1));
+                let (from, to) = (start(year), start(year + 1));
+                let before = stats::range(&h.entries, start(year - 1), from).len();
+                let e = self.summary(&h, from, to, format!("{year} in music")).await?;
                 let plays = stats::range(&h.entries, from, to).len();
+                let mut footer = h.tz_note();
                 if before > 0 {
-                    let change = (plays as f64 / before as f64 - 1.0) * 100.0;
-                    e = e.footer(EmbedFooterBuilder::new(format!("{change:+.0}% plays compared to {}", year - 1)));
+                    footer = format!("{:+.0}% plays compared to {}\n{footer}", (plays as f64 / before as f64 - 1.0) * 100.0, year - 1);
                 }
-                e
+                e.footer(EmbedFooterBuilder::new(footer))
             }
             Hc::Recap => {
                 let (from, label) = since(&o, Some(30), "month");
-                self.summary(&h, from, i64::MAX, format!("Your {label}")).await?
+                let e = self.summary(&h, from, i64::MAX, format!("Your {label}")).await?;
+                let mut footer = h.tz_note();
+                // Alistral's reports compare each period with the one just before it, of the same length; all time has none.
+                if let Some(days) = o.period.as_ref().map_or(Some(30), |p| p.0) {
+                    let plays = stats::range(&h.entries, from, i64::MAX).len();
+                    let before = stats::range(&h.entries, from - days * DAY, from).len();
+                    if before > 0 {
+                        footer = format!("{:+.0}% plays compared to the {label} before\n{footer}", (plays as f64 / before as f64 - 1.0) * 100.0);
+                    }
+                }
+                e.footer(EmbedFooterBuilder::new(footer))
             }
             Hc::Taste => match ctx.guild {
                 Some(g) => return Ok(self.taste(user, &h, g, arg).await?.into()),
@@ -298,6 +329,19 @@ impl Bot {
                 let (from, label) = since(&o, Some(30), "month");
                 self.receipt(&h, user, from, &label).await?
             }
+            Hc::Overdue => self.overdue(&h, &o).await?,
+            Hc::Comebacks => self.comebacks(&h, &o).await?,
+            Hc::OnThisDay => self.on_this_day(&h).await?,
+            Hc::Movers => self.movers(&h, &o).await?,
+            Hc::Growth => return self.growth(ctx, user, &h, arg, note).await,
+            Hc::Obsessions => self.obsessions(&h).await?,
+            Hc::Hidden => self.hidden(&h, &o).await?,
+            Hc::Obscurity => self.obscurity(ctx, user, &h, &o).await?,
+            Hc::ServerIceberg => unreachable!("handled above"),
+            Hc::Decades => return self.decades(ctx, &h, &o, note).await,
+            Hc::ListeningTime => self.listening_time(&h, &o).await?,
+            Hc::Clock => return self.clock(ctx, &h, &o, note).await,
+            Hc::Unlinked => self.unlinked(&h).await?,
         };
         Ok(with_note(out.build(), note).into())
     }
@@ -305,7 +349,7 @@ impl Bot {
     /// A page turn on an overview: the same days as when it was sent, without fetching new listens.
     pub(crate) async fn overview_turn(&self, ctx: &Ctx, today: i64, page: usize) -> Result<Out> {
         let Some(user) = self.registered(ctx).await? else { return Ok(reply("Your account is gone.").into()) };
-        let h = self.load(user.id).await?;
+        let h = self.load(&user).await?;
         self.overview(ctx, &h, today, page, None).await
     }
 
@@ -317,24 +361,28 @@ impl Bot {
         if let Some(art) = [&card, &own].into_iter().find_map(|k| cache_get(&self.art_cache.lock().unwrap(), k)) {
             return art.tags;
         }
-        let q = format!("artist:{}", crate::lb::phrase(artist));
-        let found = self.ingest.lb.mb_search("artist", &q).await.inspect_err(|e| tracing::debug!(error = ?e, "genre lookup skipped")).ok()?;
+        // The stored id reads the right artist's record; a name search can pick a namesake.
+        let found = match self.stored_artist_mbid(artist).await {
+            Some(mbid) => self.ingest.lb.mb_artist(&mbid).await.map(Some),
+            None => self.ingest.lb.mb_search("artist", &format!("artist:{}", crate::lb::phrase(artist))).await,
+        };
+        let found = found.inspect_err(|e| tracing::debug!(error = ?e, "genre lookup skipped")).ok()?;
         let tags = found.as_ref().and_then(crate::lb::tags);
         let art = Art { tags: tags.clone(), ..Art::default() };
         cache_put(&mut self.art_cache.lock().unwrap(), own, art, std::time::Instant::now());
         tags
     }
 
-    pub(crate) async fn load(&self, user_id: i32) -> Result<Hist> {
-        let entries = self.db().history(user_id).await?;
+    pub(crate) async fn load(&self, user: &User) -> Result<Hist> {
+        let entries = self.db().history(user.id).await?;
         let mut tracks: Vec<i32> = entries.iter().map(|e| e.track).collect();
         tracks.sort_unstable();
         tracks.dedup();
-        Ok(Hist { artist: self.db().track_artists(&tracks).await?, entries })
+        Ok(Hist { artist: self.db().track_artists(&tracks).await?, entries, tz: Tz::new(user.tz.as_deref()) })
     }
 
     /// Escaped display names; an id without one shows as "?".
-    async fn names_of(&self, kind: Kind, ids: impl IntoIterator<Item = i32>) -> Result<HashMap<i32, String>> {
+    pub(crate) async fn names_of(&self, kind: Kind, ids: impl IntoIterator<Item = i32>) -> Result<HashMap<i32, String>> {
         let ids: Vec<i32> = ids.into_iter().collect();
         let mut names: HashMap<i32, String> = self.db().names(kind, &ids).await?.into_iter().map(|(k, v)| (k, escape(&v))).collect();
         for id in ids {
@@ -345,7 +393,7 @@ impl Bot {
 
     /// The id of the typed or playing artist/album/track, with its name, unescaped (it also goes into titles,
     /// where Discord shows backslashes as they are). `Err` is a reply for the user.
-    async fn find_in(&self, user: &User, kind: Kind, query: &str) -> Result<Result<(String, i32), Embed>> {
+    pub(crate) async fn find_in(&self, user: &User, kind: Kind, query: &str) -> Result<Result<(String, i32), Embed>> {
         let query = (!query.trim().is_empty()).then(|| query.trim().to_owned());
         let (artist, name, _) = match self.subject(user, kind, query).await? {
             Ok(s) => s,
@@ -359,10 +407,7 @@ impl Bot {
 
     /// fmbot's overview: days with listens from the last four weeks, four per page, newest first.
     async fn overview(&self, ctx: &Ctx, h: &Hist, today: i64, page: usize, note: Option<&str>) -> Result<Out> {
-        let days: Vec<i64> = (today - OVERVIEW_DAYS + 1..=today)
-            .rev()
-            .filter(|d| !stats::range(&h.entries, d * DAY, (d + 1) * DAY).is_empty())
-            .collect();
+        let days: Vec<i64> = (today - OVERVIEW_DAYS + 1..=today).rev().filter(|d| !h.day(*d).is_empty()).collect();
         if days.is_empty() {
             return Ok(reply("No listens in the last four weeks.").into());
         }
@@ -371,7 +416,7 @@ impl Bot {
         let shown = &days[page * PER_PAGE..((page + 1) * PER_PAGE).min(days.len())];
         let mut sections = Vec::new();
         for &day in shown {
-            let slice = stats::range(&h.entries, day * DAY, (day + 1) * DAY);
+            let slice = h.day(day);
             let mut lines = vec![format!("**{}** · {} plays", day_label(day), slice.len())];
             let mut genre_done = false;
             for kind in [Kind::Artist, Kind::Album, Kind::Track] {
@@ -387,13 +432,14 @@ impl Bot {
             }
             sections.push(lines.join("\n"));
         }
-        let slice = stats::range(&h.entries, shown[shown.len() - 1] * DAY, (shown[0] + 1) * DAY);
-        let plays: usize = shown.iter().map(|d| stats::range(&h.entries, d * DAY, (d + 1) * DAY).len()).sum();
+        let slice = stats::range(&h.entries, h.tz.start(shown[shown.len() - 1]), h.tz.start(shown[0] + 1));
+        let plays: usize = shown.iter().map(|d| h.day(*d).len()).sum();
         let tracks = stats::top(slice, |e| Some(e.track)).len();
         let footer = format!(
-            "{}/{pages} · {tracks} different tracks · {plays} plays · {:.1} avg\nDays are UTC",
+            "{}/{pages} · {tracks} different tracks · {plays} plays · {:.1} avg\n{}",
             page + 1,
-            plays as f64 / shown.len() as f64
+            plays as f64 / shown.len() as f64,
+            h.tz_note()
         );
         let embed = EmbedBuilder::new()
             .color(COLOR)
@@ -430,9 +476,9 @@ impl Bot {
         let first = stats::first_plays(&h.entries, h.key(Kind::Artist));
         let [artists, albums, tracks] = [Kind::Artist, Kind::Album, Kind::Track].map(|k| stats::top(slice, h.key(k)));
         let new = artists.iter().filter(|(k, _)| first[k] >= slice[0].ts).count();
-        let busiest = stats::top(slice, |e| Some(e.ts.div_euclid(DAY) as i32))[0];
+        let busiest = stats::top(slice, |e| Some(h.tz.day(e.ts) as i32))[0];
         let mut desc = format!(
-            "**{}** plays · **{}** artists ({new} new) · **{}** albums · **{}** tracks\nBusiest day: {} (UTC) with {} plays",
+            "**{}** plays · **{}** artists ({new} new) · **{}** albums · **{}** tracks\nBusiest day: {} with {} plays",
             slice.len(),
             artists.len(),
             albums.len(),
@@ -459,7 +505,7 @@ impl Bot {
         if other.id == user.id {
             return Ok(reply("That's you. Mention someone else."));
         }
-        let theirs = self.load(other.id).await?;
+        let theirs = self.load(&other).await?;
         let (from, label) = since(&opts(rest), None, "all time");
         let count = |h: &Hist| -> (HashMap<i32, i64>, i64) {
             let slice = stats::range(&h.entries, from, i64::MAX);
@@ -497,48 +543,33 @@ impl Bot {
     async fn iceberg(&self, ctx: &Ctx, h: &Hist, from: i64, label: &str, note: Option<&str>) -> Result<Out> {
         let slice = stats::range(&h.entries, from, i64::MAX);
         let artists: Vec<i32> = stats::top(slice, h.key(Kind::Artist)).into_iter().take(50).map(|t| t.0).collect();
-        // One track per artist (their most played) is how LB's lookup finds the artist's id.
-        let mut track_of: HashMap<i32, i32> = HashMap::new();
-        for (t, _) in stats::top(slice, |e| Some(e.track)) {
-            if let Some(a) = h.artist.get(&t).filter(|a| artists.contains(a)) {
-                track_of.entry(*a).or_insert(t);
-            }
-        }
-        let artist_names = self.db().names(Kind::Artist, &artists).await?;
-        let track_names = self.db().names(Kind::Track, &track_of.values().copied().collect::<Vec<_>>()).await?;
-        let pairs: Vec<(String, String)> = artists
-            .iter()
-            .filter_map(|a| {
-                let artist = artist_names.get(a)?;
-                let full = track_names.get(track_of.get(a)?)?;
-                Some((artist.clone(), full.strip_prefix(&format!("{artist} - ")).unwrap_or(full).to_owned()))
-            })
-            .collect();
-        if pairs.is_empty() {
+        if artists.is_empty() {
             return Ok(reply(format!("No listens ({label}).")).into());
         }
-        let counts = self.ingest.lb.artist_listeners(&pairs).await?;
+        self.iceberg_picture(&ctx.name, label, &artists, "Top 50 artists", note).await
+    }
+
+    /// `artists` on the iceberg picture by how many ListenBrainz users listened to them. Their ids come from the
+    /// database or one lookup (see `meta`), the counts from `/1/popularity/artist`.
+    pub(crate) async fn iceberg_picture(&self, title: &str, label: &str, artists: &[i32], what: &str, note: Option<&str>) -> Result<Out> {
+        let mbids = self.artist_mbids(artists).await?;
+        let counts = self.popularity("artist", &mbids.values().map(String::as_str).collect::<Vec<_>>()).await?;
+        let names = self.db().names(Kind::Artist, artists).await?;
         let mut tiers: Vec<Vec<String>> = vec![Vec::new(); stats::TIERS.len()];
         let mut unknown = 0;
-        for ((artist, _), count) in pairs.iter().zip(counts) {
-            match count {
-                Some(c) => tiers[stats::tier(c)].push(artist.clone()),
+        for a in artists {
+            match mbids.get(a).and_then(|m| counts.get(m)) {
+                Some(&(listeners, _)) => tiers[stats::tier(listeners)].push(names.get(a).cloned().unwrap_or_else(|| "?".into())),
                 None => unknown += 1,
             }
         }
-        let title = ctx.name.clone();
-        let label = label.to_owned();
+        let (title, label) = (title.to_owned(), label.to_owned());
         let png = tokio::task::spawn_blocking(move || crate::iceberg::render(&title, &label, &tiers)).await??;
-        let mut footer = "Top 50 artists, deeper = fewer ListenBrainz listeners".to_owned();
+        let mut footer = format!("{what}, deeper = fewer ListenBrainz listeners");
         if unknown > 0 {
             footer.push_str(&format!(" · {unknown} not found on ListenBrainz"));
         }
-        let embed = EmbedBuilder::new()
-            .color(COLOR)
-            .image(ImageSource::attachment("iceberg.png")?)
-            .footer(EmbedFooterBuilder::new(footer))
-            .build();
-        Ok(Out { embed: with_note(embed, note), components: Vec::new(), files: vec![Attachment::from_bytes("iceberg.png".into(), png, 0)] })
+        Ok(picture("iceberg.png", png, footer, note))
     }
 
     async fn receipt(&self, h: &Hist, user: &User, from: i64, label: &str) -> Result<EmbedBuilder> {
@@ -559,7 +590,16 @@ impl Bot {
     }
 }
 
-fn embed(title: String, desc: String) -> EmbedBuilder {
+/// A reply that is one picture, with a footer.
+pub(crate) fn picture(file: &str, png: Vec<u8>, footer: String, note: Option<&str>) -> Out {
+    let mut embed = EmbedBuilder::new().color(COLOR).footer(EmbedFooterBuilder::new(footer));
+    if let Ok(img) = ImageSource::attachment(file) {
+        embed = embed.image(img);
+    }
+    Out { embed: with_note(embed.build(), note), components: Vec::new(), files: vec![Attachment::from_bytes(file.into(), png, 0)] }
+}
+
+pub(crate) fn embed(title: String, desc: String) -> EmbedBuilder {
     let mut e = EmbedBuilder::new().color(COLOR).description(desc.chars().take(4096).collect::<String>());
     if !title.is_empty() {
         e = e.title(title.chars().take(256).collect::<String>());

@@ -27,13 +27,24 @@ The default prefix is `,` (so it doesn't clash with fmbot's `.`), and every comm
 | `,c` `,ac` `,tc` | An image chart of your top albums, artists or tracks, with fmbot's options (`,c 4x4 month nt pc s`, `,aoty 2023`), with an Edit button that reopens the settings |
 | `,taste @user` | Compare your taste with someone |
 | `,aff` | Who in this server listens most like you |
+| `,od` | Overdue: what you used to play often and, at your usual pace, should have played again |
+| `,comebacks` `,movers` | What you came back to after a break, and what climbed your all-time top, in a period |
+| `,otd` | This date in earlier years, and songs released on it |
+| `,obsessions` | Your biggest days with one song, and artists you know for one song |
+| `,hidden` | Your tracks with the biggest share of all their ListenBrainz listens |
+| `,ug` | How underground your artists are (0-100), ranked against the server |
+| `,sice` | The server's top artists on an iceberg |
+| `,growth` `,decades` `,clock` | Charts: plays per year or month, by release decade, by weekday and hour |
+| `,lt` | Listening time, from track lengths |
+| `,unlinked` | Your top tracks ListenBrainz can't match to MusicBrainz |
+| `/timezone` | The time zone your days and hours are counted in; suggests the one for your Discord language |
 | `,update` | Fetch your latest listens |
 | `,privacy` | Show or hide yourself in global lists |
 | `,remove` | Delete your account and data |
 | `/prefix` | Change the server's prefix (needs Manage Server) |
 | `/refreshmembers` | Reload the server's member list (needs Manage Server) |
 
-Without an argument, `,w`, `,wa` and `,wt` use the track you are playing. With one, they take `Artist` or `Artist - Name`. The same goes for `,dd`, `,ll` and `,apc`. Commands over a period take `week`, `month`, `quarter`, `half`, `year`, `alltime` or a number of days like `90d`; `,streaks`, `,gaps` and `,discoveries` also take `albums` or `tracks`.
+Without an argument, `,w`, `,wa` and `,wt` use the track you are playing. With one, they take `Artist` or `Artist - Name`. The same goes for `,dd`, `,ll` and `,apc`. Commands over a period take `week`, `month`, `quarter`, `half`, `year`, `alltime` or a number of days like `90d`; `,streaks`, `,gaps`, `,discoveries`, `,od`, `,comebacks` and `,movers` also take `artists`, `albums` or `tracks`.
 
 After you log in, the bot downloads your full history from ListenBrainz as an export, which can take a few minutes for large accounts, and then deletes your token. From then on it fetches only new listens. If you import or delete older listens on ListenBrainz, `,update` tells you, and `/login` downloads everything again.
 
@@ -75,6 +86,10 @@ The database test is skipped when `TEST_DATABASE_URL` is not set. Point it at a 
 | `src/ingest.rs` | History download and updates |
 | `src/lb.rs` | ListenBrainz and MusicBrainz client, rate limiting |
 | `src/db.rs` | All SQL |
+| `src/hist.rs` `src/fun.rs` | History and stats commands; math in `src/stats.rs` |
+| `src/meta.rs` | MusicBrainz ids, track facts and popularity for the stats |
+| `src/tz.rs` | Users' time zones |
+| `src/draw.rs` `src/iceberg.rs` `src/graph.rs` `src/chart.rs` | Pictures |
 | `src/history.rs` | Compressed history format |
 | `src/crypto.rs` | Token encryption |
 | `migrations/` | Database schema |
