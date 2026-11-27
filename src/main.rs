@@ -1,4 +1,5 @@
 mod bot;
+mod chart;
 mod crypto;
 mod db;
 mod draw;
@@ -75,6 +76,7 @@ async fn main() -> Result<()> {
         popularity_cache: Default::default(),
         featured,
         owner,
+        chart_uses: Default::default(),
     });
 
     let intents = Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;

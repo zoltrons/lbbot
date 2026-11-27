@@ -179,6 +179,7 @@ mod tests {
             guild_names: Default::default(),
             art_cache: Default::default(),
             popularity_cache: Default::default(),
+            chart_uses: Default::default(),
             featured: Default::default(),
             owner: None,
         };

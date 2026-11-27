@@ -113,6 +113,14 @@ Some commands port ideas from [Alistral](https://github.com/RustyNova016/Alistra
 - `,growth`, `,decades` and `,clock` are pictures (`src/graph.rs`): plays per year or per month of a year (optionally one artist), plays by the decade your 500 most played tracks came out, and plays by weekday and hour.
 - `,unlinked`: your top 100 tracks LB can't match to MusicBrainz, which the id-based commands skip, with a pointer to LB's page for linking listens.
 
+## Charts
+
+`,c`, `,ac` and `,tc` (`/chart albums|artists|tracks`, `src/chart.rs`) rank the user's albums, artists or tracks from their history, like the other history commands, and draw the covers as a grid. They take fmbot's options: a size up to 100 images (`5x4`, at most 20 on a side), a period, `nt` (no titles), `pc` (playcounts), `s` (skip entries without an image), `rainbow` (sort by the covers' average color, which also skips those without one), and for albums `r:2023`, `d:90s` and `ns` (hide singles). Words left over name an artist to filter on. `,aoty` and `,aotd` filter on this year or decade, or the one given.
+
+Covers are found in batches of 50: one bulk `/1/metadata/lookup` of each entry's most played track (and its album), one `/1/metadata/recording` for those recordings' releases, and for the album release filters one `/1/metadata/release_group` for the release date and type. The track's release is the one its ListenBrainz page shows. For an album that release can be a different album (a song heard on a compilation shows its original album), so then the release the lookup matched by album name gives the cover, and the album's date and type count as unknown. A chart with filters or skipping looks through at most the top 200 entries of the period. Like fmbot, a user can make 4 charts per 40 seconds, since all commands share LB's 30 requests per 10 seconds. Covers are the Cover Art Archive's 250 or 500px thumbnails, downloaded 16 at a time and drawn with resvg. A square is 300px, less for big charts so the PNG stays a few MB (10x10 is about 2.3 MB). Artists show the same photos as the cards. A chart fetches at most three photos that aren't cached, because MusicBrainz allows one request a second; the others show the artist's most played album until a later chart caches their photo.
+
+The Edit button holds the chart's settings in its id, so it keeps working after a restart. It opens fmbot's settings form, and the form redraws the chart in the same message. Only the person who ran the command can use it. `user:` / a mention shows a server member's chart, with the same member check as `,taste`.
+
 ## Deleting data
 
 `/remove confirm:True` deletes the user's account, history, counter rows and server memberships. It refuses while an index for that user is still running, because the index would write the data back.

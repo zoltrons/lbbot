@@ -18,6 +18,24 @@ pub fn top(entries: &[Entry], key: impl Fn(&Entry) -> Option<i32>) -> Vec<(i32, 
     v
 }
 
+/// Each key's most played (track, album) pair, ties to the lowest ids: the names a chart looks its cover up by.
+pub fn top_pairs(entries: &[Entry], key: impl Fn(&Entry) -> Option<i32>) -> HashMap<i32, (i32, i32)> {
+    let mut counts: HashMap<(i32, i32, i32), u32> = HashMap::new();
+    for e in entries {
+        if let Some(k) = key(e) {
+            *counts.entry((k, e.track, e.album)).or_default() += 1;
+        }
+    }
+    let mut best: HashMap<i32, (u32, i32, i32)> = HashMap::new();
+    for ((k, track, album), n) in counts {
+        let b = best.entry(k).or_insert((n, track, album));
+        if (n, std::cmp::Reverse((track, album))) > (b.0, std::cmp::Reverse((b.1, b.2))) {
+            *b = (n, track, album);
+        }
+    }
+    best.into_iter().map(|(k, (_, track, album))| (k, (track, album))).collect()
+}
+
 /// The listens in [from, to).
 pub fn range(entries: &[Entry], from: i64, to: i64) -> &[Entry] {
     let a = entries.partition_point(|e| e.ts < from);
@@ -349,6 +367,18 @@ mod tests {
 
     fn e(ts: i64, track: i32) -> Entry {
         Entry { ts, track, album: 0 }
+    }
+
+    #[test]
+    fn top_pairs_pick_the_most_played_then_lowest_ids() {
+        let p = |track, album| Entry { ts: 0, track, album };
+        // Album 7: track 2 twice beats track 1 once; album 8: a tie goes to the lower track id.
+        let h = [p(1, 7), p(2, 7), p(2, 7), p(5, 8), p(4, 8)];
+        let pairs = top_pairs(&h, |x| Some(x.album));
+        assert_eq!((pairs[&7], pairs[&8]), ((2, 7), (4, 8)));
+        // By track: the album it was played from most.
+        let h = [p(3, 9), p(3, 6), p(3, 9)];
+        assert_eq!(top_pairs(&h, |x| Some(x.track))[&3], (3, 9));
     }
 
     #[test]

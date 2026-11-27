@@ -24,6 +24,7 @@ The default prefix is `,` (so it doesn't clash with fmbot's `.`), and every comm
 | `,year` `,recap` | Summary of a year or a period |
 | `,receipt` | Your top tracks as a receipt |
 | `,iceberg` | Your top artists drawn on an iceberg, deeper for those fewer ListenBrainz users listen to |
+| `,c` `,ac` `,tc` | An image chart of your top albums, artists or tracks, with fmbot's options (`,c 4x4 month nt pc s`, `,aoty 2023`), with an Edit button that reopens the settings |
 | `,taste @user` | Compare your taste with someone |
 | `,aff` | Who in this server listens most like you |
 | `,od` | Overdue: what you used to play often and, at your usual pace, should have played again |

@@ -340,7 +340,8 @@ impl Lb {
         Ok(featured_candidates(&self.json(req, Prio::Background).await?))
     }
 
-    /// Downloads an image (at most 8 MB) and returns it as a `data:` URI, the form Discord takes for avatars.
+    /// Downloads a JPEG or PNG image (at most 8 MB) and returns it as a `data:` URI, the form Discord takes for
+    /// avatars and resvg for pictures in an SVG.
     pub async fn image_data_uri(&self, url: &str) -> Result<String> {
         let resp = self.http.get(url).send().await?.error_for_status()?;
         let kind = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
@@ -479,11 +480,32 @@ impl Lb {
     /// The release the track's ListenBrainz page shows (including `caa_id` and `caa_release_mbid`). A lookup or the
     /// listen's mapping may pick another release (single, deluxe); taking it from here keeps the cover in line with the page.
     pub async fn recording_release(&self, recording_mbid: &str) -> Result<Value> {
+        Ok(self.recording_releases(&[recording_mbid]).await?.remove(recording_mbid).unwrap_or_default())
+    }
+
+    /// `recording_release` for up to 50 recordings in one request, by recording id. The release also carries
+    /// `release_group_mbid` and `year`.
+    pub async fn recording_releases(&self, mbids: &[&str]) -> Result<HashMap<String, Value>> {
+        if mbids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut url = self.url(&["1", "metadata", "recording", ""], &[]);
-        url.query_pairs_mut().append_pair("recording_mbids", recording_mbid).append_pair("inc", "release");
+        url.query_pairs_mut().append_pair("recording_mbids", &mbids.join(",")).append_pair("inc", "release");
         let req = self.http.get(url).header("Authorization", format!("Token {}", self.service_token));
-        let mut body = self.json(req, Prio::Command).await?;
-        Ok(body[recording_mbid]["release"].take())
+        let body = self.json(req, Prio::Command).await?;
+        Ok(body.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v["release"].clone())).collect())
+    }
+
+    /// Release groups (`type` such as Album or Single, first release `date`, cover) for up to 50 ids, by id.
+    pub async fn release_groups(&self, mbids: &[&str]) -> Result<HashMap<String, Value>> {
+        if mbids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut url = self.url(&["1", "metadata", "release_group", ""], &[]);
+        url.query_pairs_mut().append_pair("release_group_mbids", &mbids.join(","));
+        let req = self.http.get(url).header("Authorization", format!("Token {}", self.service_token));
+        let body = self.json(req, Prio::Command).await?;
+        Ok(body.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v["release_group"].clone())).collect())
     }
 
     /// MusicBrainz mappings of up to 50 `(artist, track, album)` names in one request, in the same order. `Null` when
@@ -662,6 +684,20 @@ pub fn tags(v: &Value) -> Option<String> {
     (!names.is_empty()).then(|| names.join(" - "))
 }
 
+/// A smaller copy of a cover or photo URL made in this file: the Cover Art Archive has 250 and 500px thumbnails,
+/// Apple any size. Other URLs (Tidal's 750px photos) stay as they are.
+pub fn thumb(url: &str, px: u32) -> String {
+    if url.starts_with("https://coverartarchive.org/")
+        && let Some((head, tail)) = url.rsplit_once("-1200")
+    {
+        return format!("{head}-{}{tail}", if px <= 250 { 250 } else { 500 });
+    }
+    match url.strip_suffix("/1200x1200cc.jpg") {
+        Some(base) if url.contains(".mzstatic.com/") => format!("{base}/{px}x{px}cc.jpg"),
+        _ => url.to_owned(),
+    }
+}
+
 /// 1200px cover URL from an object with `caa_id` + `caa_release_mbid`; otherwise the front cover of `release_mbid`.
 pub fn cover_url(v: &Value) -> Option<String> {
     match (v["caa_release_mbid"].as_str(), v["caa_id"].as_i64()) {
@@ -748,6 +784,10 @@ pub(crate) mod tests {
         let rel = serde_json::json!({"release_mbid": "r2"});
         assert_eq!(super::cover_url(&rel).unwrap(), "https://coverartarchive.org/release/r2/front-1200");
         assert!(super::cover_url(&serde_json::json!({})).is_none());
+        assert_eq!(super::thumb("https://coverartarchive.org/release/a-1200b/5-1200.jpg", 300), "https://coverartarchive.org/release/a-1200b/5-500.jpg");
+        assert_eq!(super::thumb("https://coverartarchive.org/release-group/r/front-1200", 200), "https://coverartarchive.org/release-group/r/front-250");
+        assert_eq!(super::thumb("https://is1.mzstatic.com/image/thumb/x/1200x1200cc.jpg", 300), "https://is1.mzstatic.com/image/thumb/x/300x300cc.jpg");
+        assert_eq!(super::thumb("https://resources.tidal.com/images/a/750x750.jpg", 300), "https://resources.tidal.com/images/a/750x750.jpg");
         let html = r#"<meta property="og:image" content="https://is1.mzstatic.com/x/a.png/1200x630cw.png">"#;
         assert_eq!(super::og_image(html).unwrap(), "https://is1.mzstatic.com/x/a.png/1200x630cw.png");
         assert!(super::og_image("<meta>").is_none());
