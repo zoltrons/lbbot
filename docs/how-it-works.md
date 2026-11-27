@@ -46,7 +46,7 @@ Names stay the key, but some commands need to know which MusicBrainz artist or r
 
 Listens stored before this existed have no ids. A command that needs one looks it up by name with LB's bulk lookup (50 names per request, at most 200 per command, most played first) and stores what it finds. A track LB can't match is marked, so it isn't looked up again. Release dates and lengths come from `/1/metadata/recording` (1000 recordings per request) once per track and are stored in `tracks.released` and `tracks.length_ms` (`src/meta.rs`).
 
-The other name-based paths share these ids. Every bulk lookup, including the one `,c` makes for covers, stores the recording and artist ids it found. Cards and the genre line of `,o` read an artist's or track's stored id before searching MusicBrainz or LB by name, so they get the right artist when two share a name, and need no lookup.
+The other name-based paths share these ids. Every bulk lookup, including the one `,c` makes for covers, stores the recording and artist ids it found. Cards and the genre line of `,o` read an artist's or track's stored id instead of searching MusicBrainz or LB by name. Artists who share a name share an entry and so a stored id; an artist card for a playing track therefore looks the artist up by that track first, and uses the stored id for a typed name or when the track doesn't match.
 
 ## Storage
 

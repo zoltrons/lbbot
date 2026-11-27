@@ -989,21 +989,7 @@ impl Bot {
         let lb = &self.ingest.lb;
         Ok(match kind {
             Kind::Artist => {
-                // An id stored from listens or an earlier lookup (see `meta`) is as sure as a mapping's and costs no request.
-                if mapping["artist_mbids"].get(0).is_none()
-                    && let Some(m) = self.stored_artist_mbid(artist).await
-                {
-                    mapping["artist_mbids"] = serde_json::json!([m]);
-                }
-                // Without a mapping (playing-now) it comes from a lookup: the first id is the main artist ("A feat. B" → A).
-                if mapping["artist_mbids"].get(0).is_none()
-                    && let Some(t) = track
-                {
-                    match lb.lookup(artist, t, album).await {
-                        Ok(m) => mapping = m,
-                        Err(e) => tracing::warn!(error = ?e, "artist lookup failed"),
-                    }
-                }
+                mapping = self.card_artist_mapping(artist, track, album, mapping).await;
                 // A search can pick the wrong one of two artists with the same name; the playing track's id is certain. Tags only come from the same artist.
                 let known = mapping["artist_mbids"].get(0).and_then(Value::as_str);
                 let (searched, photo) = match known {
