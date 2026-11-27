@@ -336,7 +336,8 @@ impl Bot {
         };
         let play = |e: &Entry| len(e.track).unwrap_or(avg as i64);
         let total: i64 = slice.iter().map(play).sum();
-        let span = (now() - from.max(slice[0].ts)) as f64 / DAY as f64;
+        // Silent days of the period count too; only time before the first listen doesn't.
+        let span = (now() - from.max(h.entries[0].ts)) as f64 / DAY as f64;
         let mut desc = format!("**{}** ({label}) · {} a day on average", duration(total), duration((total as f64 / span.max(1.0)) as i64));
         for (kind, title) in [(Kind::Artist, "Artists"), (Kind::Track, "Tracks")] {
             let by = stats::time_by(slice, h.key(kind), play);

@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::{
     bot::{Bot, cache_get, cache_put},
     db::{Kind, TrackFacts},
-    lb::uuid,
+    lb::{artist_key, uuid},
 };
 
 /// Tracks or artists looked up by name per command: LB takes 50 per request.
@@ -62,7 +62,7 @@ impl Bot {
     /// the ones found are stored. Artists LB can't match are left out (and tried again next time).
     pub(crate) async fn artist_mbids(&self, artists: &[i32]) -> Result<HashMap<i32, String>> {
         let (db, lb) = (self.db(), &self.ingest.lb);
-        let mut known = db.artist_mbids(artists).await?;
+        let known = db.artist_mbids(artists).await?;
         let missing: Vec<i32> = artists.iter().copied().filter(|a| !known.contains_key(a)).take(LOOKUPS).collect();
         if missing.is_empty() {
             return Ok(known);
@@ -76,13 +76,9 @@ impl Bot {
             let found = lb.lookup_many(&items).await?;
             // A miss doesn't mark the track: it was looked up for its artist, not for itself.
             self.save_found(&chunk.iter().map(|p| p.1).collect::<Vec<_>>(), &found).await?;
-            for (&(a, _), r) in chunk.iter().zip(&found) {
-                if let Some(m) = uuid(&r["artist_mbids"][0]) {
-                    known.insert(a, m);
-                }
-            }
         }
-        Ok(known)
+        // What the database kept: an id stored meanwhile (by a listen) wins over this lookup's.
+        db.artist_mbids(artists).await
     }
 
     /// Stores what a name lookup found for `tracks` (`found` in the same order, from `Lb::lookup_many`): each
@@ -91,13 +87,20 @@ impl Bot {
     pub(crate) async fn save_found(&self, tracks: &[i32], found: &[Value]) -> Result<()> {
         let db = self.db();
         let artists = db.track_artists(tracks).await?;
+        let names = db.names(Kind::Artist, &artists.values().copied().collect::<Vec<_>>()).await?;
         let (mut track_ids, mut recordings, mut artist_ids, mut artist_mbids) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (t, r) in tracks.iter().zip(found) {
             if let Some(m) = uuid(&r["recording_mbid"]) {
                 track_ids.push(*t);
                 recordings.push(Some(m));
             }
-            if let (Some(a), Some(m)) = (artists.get(t), uuid(&r["artist_mbids"][0])) {
+            // An entry named like a whole shared credit ("A & B" from a player without a mapping) is no single
+            // artist, so it gets no artist id; the first artist's would lend it A's popularity.
+            let credit = artist_key(r["artist_credit_name"].as_str().unwrap_or_default()).to_lowercase();
+            let shared = |a: &i32| r["artist_mbids"].as_array().is_some_and(|m| m.len() > 1) && names.get(a).is_some_and(|n| n.to_lowercase() == credit);
+            if let (Some(a), Some(m)) = (artists.get(t), uuid(&r["artist_mbids"][0]))
+                && !shared(a)
+            {
                 artist_ids.push(*a);
                 artist_mbids.push(m);
             }
@@ -277,6 +280,15 @@ mod tests {
         bot.save_found(&[missing, new], &[serde_json::json!({"recording_mbid": chart_found}), serde_json::Value::Null]).await?;
         assert_eq!(bot.stored_track_mbid(&artist, "Missing").await.as_deref(), Some(chart_found));
         assert_eq!(bot.stored_track_mbid(&artist, "Unknown to LB").await.as_deref(), Some(new_rec), "a miss changes nothing");
+
+        // An entry named like a whole shared credit gets the recording id, but not the first artist's id.
+        let combined = format!("{artist} & Someone");
+        let duet = bot.db().intern(&[Listen { listened_at: 1.0, recording_msid: None, track_metadata: TrackMetadata { artist_name: combined.clone(), track_name: "Duet".into(), ..Default::default() } }]).await?[0].track;
+        let duet_rec = "13dd61c7-0000-4000-8000-000000000004";
+        let shared = serde_json::json!({"artist_credit_name": combined, "artist_mbids": [artist_mbid, "5082a11f-7203-4ff3-ae04-2a0150d3bbb6"], "recording_mbid": duet_rec});
+        bot.save_found(&[duet], &[shared]).await?;
+        assert_eq!(bot.stored_track_mbid(&combined, "Duet").await.as_deref(), Some(duet_rec));
+        assert_eq!(bot.stored_artist_mbid(&combined).await, None);
         Ok(())
     }
 }
