@@ -518,8 +518,10 @@ impl Lb {
             let Some(&(i, _)) = r["index"].as_u64().and_then(|i| sent.get(i as usize)) else { continue };
             let credit = artist_key(r["artist_credit_name"].as_str().unwrap_or_default()).to_lowercase();
             let name = items[i].0.to_lowercase();
-            // "Eden & X" is Eden's; "Edenbridge" isn't.
-            if credit.strip_prefix(&name).is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric())) {
+            // The whole credit, or the first of several credited artists: "Eden & X" is Eden's; "Edenbridge",
+            // "Eden Project" and "Florence and the Machine" (one artist each) aren't Eden's or Florence's.
+            let several = r["artist_mbids"].as_array().is_some_and(|a| a.len() > 1);
+            if credit == name || (several && main_artist(&credit) == name) {
                 out[i] = r.clone();
             }
         }
@@ -974,17 +976,28 @@ pub(crate) mod tests {
         assert_eq!(f, super::RecordingFacts { length_ms: 0, released: 19_970_000 });
     }
 
-    /// A lookup result is only kept when its credit starts with the whole artist name: "Eden" must not take
-    /// "Edenbridge"'s ids, which would be stored for good.
+    /// A lookup result is only kept when it is credited to our artist: the whole name, or the first of several
+    /// credited artists. "Eden" must not take the ids of "Edenbridge" or "Eden Project", which would be stored for good.
     #[tokio::test]
     async fn lookup_needs_the_whole_artist_name() {
         const FOUND: &str = r#"[{"index": 0, "artist_credit_name": "Edenbridge", "artist_mbids": ["x"], "recording_mbid": "r0"},
-            {"index": 1, "artist_credit_name": "Eden & Someone", "artist_mbids": ["y"], "recording_mbid": "r1"},
-            {"index": 2, "artist_credit_name": "eden", "artist_mbids": ["z"], "recording_mbid": "r2"}]"#;
+            {"index": 1, "artist_credit_name": "Eden & Someone", "artist_mbids": ["y", "y2"], "recording_mbid": "r1"},
+            {"index": 2, "artist_credit_name": "eden", "artist_mbids": ["z"], "recording_mbid": "r2"},
+            {"index": 3, "artist_credit_name": "Eden Project", "artist_mbids": ["p"], "recording_mbid": "r3"},
+            {"index": 4, "artist_credit_name": "Florence and the Machine", "artist_mbids": ["f"], "recording_mbid": "r4"},
+            {"index": 5, "artist_credit_name": "Simon & Garfunkel", "artist_mbids": ["s"], "recording_mbid": "r5"}]"#;
         let (addr, server) = fake_lb(&[(200, 10, FOUND)]).await;
         let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
-        let found = lb.lookup_many(&[("Eden", "Wake Up", None), ("Eden", "Duet", None), ("Eden", "Solo", None)]).await.unwrap();
-        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2")]);
+        let items = [
+            ("Eden", "Wake Up", None),
+            ("Eden", "Duet", None),
+            ("Eden", "Solo", None),
+            ("Eden", "Gravity", None),
+            ("Florence", "Dog Days", None),
+            ("Simon & Garfunkel", "The Boxer", None),
+        ];
+        let found = lb.lookup_many(&items).await.unwrap();
+        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2"), None, None, Some("r5")]);
         server.await.unwrap();
     }
 
