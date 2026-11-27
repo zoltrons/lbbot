@@ -128,3 +128,67 @@ impl Bot {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use twilight_model::id::Id;
+
+    use super::*;
+    use crate::lb::{Listen, TrackMetadata};
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// Needs Postgres. The first call looks names up and fetches facts once; after that everything comes from the
+    /// database or the cache, with no requests.
+    #[tokio::test]
+    async fn looks_up_once_then_reads_what_it_stored() -> Result<()> {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else { return Ok(()) };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let db = crate::db::connect(&url, Arc::new(crate::crypto::test_crypto())).await?;
+        // A new name on every run: the name tables keep what earlier runs stored.
+        let artist = format!("Lookup {}", std::process::id());
+        let listen = |track: &str| Listen {
+            listened_at: 1.0,
+            recording_msid: None,
+            track_metadata: TrackMetadata { artist_name: artist.clone(), track_name: track.into(), ..Default::default() },
+        };
+        let entries = db.intern(&[listen("Found"), listen("Missing")]).await?;
+        let (found, missing) = (entries[0].track, entries[1].track);
+        let (artist_mbid, rec) = ("8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", "e97f805a-ab48-4c52-855e-07049142113d");
+        let responses = vec![
+            // LB matches the first track only.
+            (200, 10, leak(format!(r#"[{{"index": 0, "artist_credit_name": "{artist}", "artist_mbids": ["{artist_mbid}"], "recording_mbid": "{rec}"}}]"#))),
+            (200, 10, leak(format!(r#"{{"{rec}": {{"recording": {{"length": 238000, "first_release_date": "1994-08-22"}}, "release": {{}}}}}}"#))),
+            (200, 10, leak(format!(r#"[{{"recording_mbid": "{rec}", "total_listen_count": 1000, "total_user_count": 10}}]"#))),
+        ];
+        let (addr, server) = crate::lb::tests::fake_lb(Box::leak(responses.into_boxed_slice())).await;
+        let lb = crate::lb::Lb::with_base(&format!("http://{addr}"), String::new());
+        let bot = Bot {
+            http: Arc::new(twilight_http::Client::new(String::new())),
+            app_id: Id::new(1),
+            ingest: crate::ingest::Ingest::new(db, lb),
+            prefixes: Default::default(),
+            guild_names: Default::default(),
+            art_cache: Default::default(),
+            popularity_cache: Default::default(),
+            featured: Default::default(),
+            owner: None,
+        };
+
+        let facts = bot.track_facts(&[found, missing]).await?;
+        assert_eq!(facts[&found], TrackFacts { mbid: Some(rec.into()), length_ms: Some(238_000), released: Some(19_940_822) });
+        assert_eq!(facts[&missing], TrackFacts { mbid: None, length_ms: Some(0), released: Some(0) }, "marked as looked up");
+        let artist_id = bot.db().track_artists(&[found]).await?[&found];
+        assert_eq!(bot.artist_mbids(&[artist_id]).await?[&artist_id], artist_mbid, "stored by the track lookup");
+        assert_eq!(bot.popularity("recording", &[rec]).await?[rec], (10, 1000));
+        // A fourth request would find the fake server gone and fail.
+        assert_eq!(bot.track_facts(&[found, missing]).await?, facts);
+        assert_eq!(bot.popularity("recording", &[rec]).await?[rec], (10, 1000));
+        assert_eq!(server.await?.len(), 3);
+        Ok(())
+    }
+}

@@ -214,7 +214,7 @@ impl Lb {
         Self::with_base(API, service_token)
     }
 
-    fn with_base(base: &str, service_token: String) -> Self {
+    pub(crate) fn with_base(base: &str, service_token: String) -> Self {
         let http = reqwest::Client::builder()
             // MusicBrainz asks for a contact address in the User-Agent.
             .user_agent(concat!("lbbot/", env!("CARGO_PKG_VERSION"), " ( https://github.com/zoltrons/lbbot )"))
@@ -517,7 +517,9 @@ impl Lb {
         for r in self.json(req, Prio::Command).await?.as_array().into_iter().flatten() {
             let Some(&(i, _)) = r["index"].as_u64().and_then(|i| sent.get(i as usize)) else { continue };
             let credit = artist_key(r["artist_credit_name"].as_str().unwrap_or_default()).to_lowercase();
-            if credit.starts_with(&items[i].0.to_lowercase()) {
+            let name = items[i].0.to_lowercase();
+            // "Eden & X" is Eden's; "Edenbridge" isn't.
+            if credit.strip_prefix(&name).is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric())) {
                 out[i] = r.clone();
             }
         }
@@ -733,7 +735,7 @@ pub fn profile_url(user: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn cover_urls() {
         let caa = serde_json::json!({"caa_release_mbid": "r1", "caa_id": 5, "release_mbid": "r2"});
@@ -814,7 +816,7 @@ mod tests {
     }
 
     /// Local fake LB: answers each connection with the next `remaining`; returns the request paths and times.
-    async fn fake_lb(
+    pub(crate) async fn fake_lb(
         responses: &'static [(u16, u32, &'static str)],
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<(tokio::time::Instant, String)>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -970,6 +972,20 @@ mod tests {
         assert_eq!(f, super::RecordingFacts { length_ms: 373_133, released: 19_940_822 });
         let f = super::RecordingFacts::from(&serde_json::json!({"recording": {}, "release": {"year": 1997}}));
         assert_eq!(f, super::RecordingFacts { length_ms: 0, released: 19_970_000 });
+    }
+
+    /// A lookup result is only kept when its credit starts with the whole artist name: "Eden" must not take
+    /// "Edenbridge"'s ids, which would be stored for good.
+    #[tokio::test]
+    async fn lookup_needs_the_whole_artist_name() {
+        const FOUND: &str = r#"[{"index": 0, "artist_credit_name": "Edenbridge", "artist_mbids": ["x"], "recording_mbid": "r0"},
+            {"index": 1, "artist_credit_name": "Eden & Someone", "artist_mbids": ["y"], "recording_mbid": "r1"},
+            {"index": 2, "artist_credit_name": "eden", "artist_mbids": ["z"], "recording_mbid": "r2"}]"#;
+        let (addr, server) = fake_lb(&[(200, 10, FOUND)]).await;
+        let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
+        let found = lb.lookup_many(&[("Eden", "Wake Up", None), ("Eden", "Duet", None), ("Eden", "Solo", None)]).await.unwrap();
+        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2")]);
+        server.await.unwrap();
     }
 
     /// Popularity and facts come back keyed by id; ids LB has no data for are left out.

@@ -201,6 +201,13 @@ pub(crate) fn since(o: &Opts, default_days: Option<i64>, default_label: &str) ->
 impl Bot {
     pub(crate) async fn hist(&self, ctx: &Ctx, user: &User, cmd: Hc, kind: Kind, arg: &str) -> Result<Out> {
         let note = (!user.indexed).then_some("Your history is still downloading, so counts may be incomplete.");
+        // The server iceberg reads the members' counters, not this user's history.
+        if cmd == Hc::ServerIceberg {
+            return match ctx.guild {
+                Some(g) => self.server_iceberg(g, note).await,
+                None => Ok(reply("The server iceberg only works in servers.").into()),
+            };
+        }
         if let Err(e) = self.ingest.update(user, Prio::Command).await {
             tracing::warn!(error = ?e, "update during history command failed");
         }
@@ -330,10 +337,7 @@ impl Bot {
             Hc::Obsessions => self.obsessions(&h).await?,
             Hc::Hidden => self.hidden(&h, &o).await?,
             Hc::Obscurity => self.obscurity(ctx, user, &h, &o).await?,
-            Hc::ServerIceberg => match ctx.guild {
-                Some(g) => return self.server_iceberg(g, note).await,
-                None => return Ok(reply("The server iceberg only works in servers.").into()),
-            },
+            Hc::ServerIceberg => unreachable!("handled above"),
             Hc::Decades => return self.decades(ctx, &h, &o, note).await,
             Hc::ListeningTime => self.listening_time(&h, &o).await?,
             Hc::Clock => return self.clock(ctx, &h, &o, note).await,

@@ -104,7 +104,11 @@ impl Bot {
             }
         }
         let top: Vec<(i32, u32)> = stats::top(&h.entries, |e| Some(e.track)).into_iter().take(300).collect();
-        let facts = self.track_facts(&top.iter().map(|t| t.0).collect::<Vec<_>>()).await?;
+        // Only the release section needs ListenBrainz; when it's down the years above still show.
+        let facts = self.track_facts(&top.iter().map(|t| t.0).collect::<Vec<_>>()).await.unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "release dates for on this day failed");
+            HashMap::new()
+        });
         let md = (month * 100 + day) as i32;
         let born: Vec<(i32, u32, i32)> = top
             .iter()
@@ -249,13 +253,15 @@ impl Bot {
             self.db().set_obscurity(user.id, score.round() as i16).await?;
         }
         rows.sort_by_key(|r| (r.2, r.0));
-        let ends: Vec<i32> = rows.iter().take(3).chain(rows.iter().rev().take(3)).map(|r| r.0).collect();
+        // Up to 3 from each end; with few artists each one shows once (a single artist shows in both).
+        let n = (rows.len() / 2).clamp(1, 3);
+        let ends: Vec<i32> = rows.iter().take(n).chain(rows.iter().rev().take(n)).map(|r| r.0).collect();
         let names = self.names_of(Kind::Artist, ends).await?;
         let list = |it: &mut dyn Iterator<Item = &(i32, u32, i64)>| it.map(|r| format!("{} ({} listeners)", names[&r.0], r.2)).collect::<Vec<_>>().join(", ");
         let mut desc = format!(
             "**{score:.0}**/100 underground ({label})\n0 = everybody knows them, 100 = nobody does.\n\n**Deepest**: {}\n**Best known**: {}",
-            list(&mut rows.iter().take(3)),
-            list(&mut rows.iter().rev().take(3))
+            list(&mut rows.iter().take(n)),
+            list(&mut rows.iter().rev().take(n))
         );
         if let Some(g) = ctx.guild {
             let ranking = self.db().member_obscurity(g).await?;

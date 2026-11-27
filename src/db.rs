@@ -34,7 +34,7 @@ pub struct User {
 }
 
 /// What the stats commands know about a track (see migration 0005).
-#[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrackFacts {
     pub mbid: Option<String>,
     pub length_ms: Option<i32>,
@@ -206,7 +206,11 @@ impl Db {
             }))
             .await?;
         let tracks = self.intern_child("tracks", listens.iter().map(|l| (artist_of(l), l.track_metadata.track_name.as_str()))).await?;
-        self.save_mapping(listens, &artists, &tracks).await?;
+        // The ids are extras that a lookup fills in later; a failure here (a deadlock with another user's index
+        // writing the same rows) must not fail the download.
+        if let Err(e) = self.save_mapping(listens, &artists, &tracks).await {
+            tracing::warn!(error = ?e, "storing mapping ids failed");
+        }
 
         Ok(listens
             .iter()
@@ -225,8 +229,9 @@ impl Db {
     /// MusicBrainz ids and lengths that came with the listens, for entities that don't have them yet. A track that
     /// gets its id here is looked up again for its facts (`released` back to NULL).
     async fn save_mapping(&self, listens: &[Listen], artists: &HashMap<String, i32>, tracks: &HashMap<(i32, String), i32>) -> Result<()> {
-        let mut artist_ids: HashMap<i32, &str> = HashMap::new();
-        let mut track_rows: HashMap<i32, (Option<&str>, Option<i32>)> = HashMap::new();
+        // Sorted, so concurrent writers lock rows in the same order.
+        let mut artist_ids: std::collections::BTreeMap<i32, &str> = Default::default();
+        let mut track_rows: std::collections::BTreeMap<i32, (Option<&str>, Option<i32>)> = Default::default();
         for l in listens {
             let m = &l.track_metadata;
             let a = artists[&m.artist_name];
