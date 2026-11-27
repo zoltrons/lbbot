@@ -989,6 +989,12 @@ impl Bot {
         let lb = &self.ingest.lb;
         Ok(match kind {
             Kind::Artist => {
+                // An id stored from listens or an earlier lookup (see `meta`) is as sure as a mapping's and costs no request.
+                if mapping["artist_mbids"].get(0).is_none()
+                    && let Some(m) = self.stored_artist_mbid(artist).await
+                {
+                    mapping["artist_mbids"] = serde_json::json!([m]);
+                }
                 // Without a mapping (playing-now) it comes from a lookup: the first id is the main artist ("A feat. B" → A).
                 if mapping["artist_mbids"].get(0).is_none()
                     && let Some(t) = track
@@ -1074,7 +1080,10 @@ impl Bot {
             Kind::Track => {
                 if mapping.get("recording_mbid").is_none() {
                     let Some(t) = track else { return Ok((Art::default(), true)) };
-                    mapping = lb.lookup(artist, t, album).await?;
+                    mapping = match self.stored_track_mbid(artist, t).await {
+                        Some(m) => serde_json::json!({ "recording_mbid": m }),
+                        None => lb.lookup(artist, t, album).await?,
+                    };
                 }
                 let Some(rec) = mapping["recording_mbid"].as_str() else { return Ok((Art::default(), true)) };
                 let url = Some(crate::lb::page_url("track", rec));

@@ -540,11 +540,12 @@ impl Lb {
             let Some(&(i, _)) = r["index"].as_u64().and_then(|i| sent.get(i as usize)) else { continue };
             let credit = artist_key(r["artist_credit_name"].as_str().unwrap_or_default()).to_lowercase();
             let name = items[i].0.to_lowercase();
-            // The whole credit, or the first of several credited artists followed by a separator: "Eden & X" is
-            // Eden's and "Earth, Wind & Fire with X" is theirs; "Edenbridge", "Eden Project" and "Florence and the
-            // Machine" (one artist each) aren't Eden's or Florence's.
+            // The whole credit, or the first of several credited artists followed by a separator (a word one, or a
+            // sign after a space such as " × " or " / "): "Eden & X", "Eden × X" and "Earth, Wind & Fire with X"
+            // match; "Edenbridge", "Eden Project", "Eden's Crew" and "Florence and the Machine" don't.
             let several = r["artist_mbids"].as_array().is_some_and(|a| a.len() > 1);
-            let first = |rest: &str| SEPARATORS.iter().any(|s| rest.starts_with(s));
+            let sign = |rest: &str| rest.starts_with(char::is_whitespace) && rest.trim_start().starts_with(|c: char| !c.is_alphanumeric());
+            let first = |rest: &str| SEPARATORS.iter().any(|s| rest.starts_with(s)) || sign(rest);
             if credit == name || (several && credit.strip_prefix(&name).is_some_and(first)) {
                 out[i] = r.clone();
             }
@@ -1030,7 +1031,10 @@ pub(crate) mod tests {
             {"index": 4, "artist_credit_name": "Florence and the Machine", "artist_mbids": ["f"], "recording_mbid": "r4"},
             {"index": 5, "artist_credit_name": "Simon & Garfunkel", "artist_mbids": ["s"], "recording_mbid": "r5"},
             {"index": 6, "artist_credit_name": "Earth, Wind & Fire with The Emotions", "artist_mbids": ["e", "e2"], "recording_mbid": "r6"},
-            {"index": 7, "artist_credit_name": "Eden Project & Someone", "artist_mbids": ["q", "q2"], "recording_mbid": "r7"}]"#;
+            {"index": 7, "artist_credit_name": "Eden Project & Someone", "artist_mbids": ["q", "q2"], "recording_mbid": "r7"},
+            {"index": 8, "artist_credit_name": "Eden × Someone", "artist_mbids": ["m", "m2"], "recording_mbid": "r8"},
+            {"index": 9, "artist_credit_name": "Eden / Someone", "artist_mbids": ["n", "n2"], "recording_mbid": "r9"},
+            {"index": 10, "artist_credit_name": "Eden's Crew & Someone", "artist_mbids": ["c", "c2"], "recording_mbid": "r10"}]"#;
         let (addr, server) = fake_lb(&[(200, 10, FOUND)]).await;
         let lb = super::Lb::with_base(&format!("http://{addr}"), String::new());
         let items = [
@@ -1042,9 +1046,12 @@ pub(crate) mod tests {
             ("Simon & Garfunkel", "The Boxer", None),
             ("Earth, Wind & Fire", "Boogie Wonderland", None),
             ("Eden", "Together", None),
+            ("Eden", "Collab", None),
+            ("Eden", "Split", None),
+            ("Eden", "Crew", None),
         ];
         let found = lb.lookup_many(&items).await.unwrap();
-        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2"), None, None, Some("r5"), Some("r6"), None]);
+        assert_eq!(found.iter().map(|r| r["recording_mbid"].as_str()).collect::<Vec<_>>(), [None, Some("r1"), Some("r2"), None, None, Some("r5"), Some("r6"), None, Some("r8"), Some("r9"), None]);
         server.await.unwrap();
     }
 

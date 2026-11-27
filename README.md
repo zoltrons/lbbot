@@ -89,7 +89,7 @@ The database test is skipped when `TEST_DATABASE_URL` is not set. Point it at a 
 | `src/hist.rs` `src/fun.rs` | History and stats commands; math in `src/stats.rs` |
 | `src/meta.rs` | MusicBrainz ids, track facts and popularity for the stats |
 | `src/tz.rs` | Users' time zones |
-| `src/draw.rs` `src/iceberg.rs` `src/graph.rs` | Pictures |
+| `src/draw.rs` `src/iceberg.rs` `src/graph.rs` `src/chart.rs` | Pictures |
 | `src/history.rs` | Compressed history format |
 | `src/crypto.rs` | Token encryption |
 | `migrations/` | Database schema |

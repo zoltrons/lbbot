@@ -361,8 +361,12 @@ impl Bot {
         if let Some(art) = [&card, &own].into_iter().find_map(|k| cache_get(&self.art_cache.lock().unwrap(), k)) {
             return art.tags;
         }
-        let q = format!("artist:{}", crate::lb::phrase(artist));
-        let found = self.ingest.lb.mb_search("artist", &q).await.inspect_err(|e| tracing::debug!(error = ?e, "genre lookup skipped")).ok()?;
+        // The stored id reads the right artist's record; a name search can pick a namesake.
+        let found = match self.stored_artist_mbid(artist).await {
+            Some(mbid) => self.ingest.lb.mb_artist(&mbid).await.map(Some),
+            None => self.ingest.lb.mb_search("artist", &format!("artist:{}", crate::lb::phrase(artist))).await,
+        };
+        let found = found.inspect_err(|e| tracing::debug!(error = ?e, "genre lookup skipped")).ok()?;
         let tags = found.as_ref().and_then(crate::lb::tags);
         let art = Art { tags: tags.clone(), ..Art::default() };
         cache_put(&mut self.art_cache.lock().unwrap(), own, art, std::time::Instant::now());

@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use serde_json::Value;
 
 use crate::{
     bot::{Bot, cache_get, cache_put},
@@ -27,16 +28,14 @@ impl Bot {
             tracks.iter().copied().filter(|t| facts.get(t).is_some_and(|f| f.mbid.is_none() && f.released.is_none())).take(LOOKUPS).collect();
         if !unknown.is_empty() {
             let names = db.name_parts(Kind::Track, &unknown).await?;
-            let artists = db.track_artists(&unknown).await?;
             for chunk in unknown.chunks(50) {
                 let items: Vec<(&str, &str, Option<&str>)> =
                     chunk.iter().map(|t| names.get(t).map_or(("", "", None), |(a, n)| (a.as_str(), n.as_str(), None))).collect();
                 let found = lb.lookup_many(&items).await?;
-                let mbids: Vec<Option<String>> = found.iter().map(|r| uuid(&r["recording_mbid"])).collect();
-                db.set_track_mbids(chunk, &mbids).await?;
-                let (ids, artist_mbids): (Vec<i32>, Vec<String>) =
-                    chunk.iter().zip(&found).filter_map(|(t, r)| Some((*artists.get(t)?, uuid(&r["artist_mbids"][0])?))).unzip();
-                db.set_artist_mbids(&ids, &artist_mbids.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+                self.save_found(chunk, &found).await?;
+                // A track LB can't match is marked as looked up, so it isn't asked again.
+                let missed: Vec<i32> = chunk.iter().zip(&found).filter(|(_, r)| uuid(&r["recording_mbid"]).is_none()).map(|(t, _)| *t).collect();
+                db.set_track_mbids(&missed, &vec![None; missed.len()]).await?;
             }
         }
         let facts = if unknown.is_empty() { facts } else { db.track_facts(tracks).await? };
@@ -75,23 +74,49 @@ impl Bot {
             let items: Vec<(&str, &str, Option<&str>)> =
                 chunk.iter().map(|(_, t)| names.get(t).map_or(("", "", None), |(a, n)| (a.as_str(), n.as_str(), None))).collect();
             let found = lb.lookup_many(&items).await?;
-            let (mut artist_rows, mut track_rows) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
-            for (&(a, t), r) in chunk.iter().zip(&found) {
+            // A miss doesn't mark the track: it was looked up for its artist, not for itself.
+            self.save_found(&chunk.iter().map(|p| p.1).collect::<Vec<_>>(), &found).await?;
+            for (&(a, _), r) in chunk.iter().zip(&found) {
                 if let Some(m) = uuid(&r["artist_mbids"][0]) {
-                    known.insert(a, m.clone());
-                    artist_rows.0.push(a);
-                    artist_rows.1.push(m);
-                }
-                // A miss here doesn't mark the track: it was looked up for its artist, not for itself.
-                if let Some(m) = uuid(&r["recording_mbid"]) {
-                    track_rows.0.push(t);
-                    track_rows.1.push(Some(m));
+                    known.insert(a, m);
                 }
             }
-            db.set_artist_mbids(&artist_rows.0, &artist_rows.1.iter().map(String::as_str).collect::<Vec<_>>()).await?;
-            db.set_track_mbids(&track_rows.0, &track_rows.1).await?;
         }
         Ok(known)
+    }
+
+    /// Stores what a name lookup found for `tracks` (`found` in the same order, from `Lb::lookup_many`): each
+    /// track's recording id and its artist's id, where they have none yet. Every lookup in the bot comes through
+    /// here, so the stats, charts and cards share what any of them found.
+    pub(crate) async fn save_found(&self, tracks: &[i32], found: &[Value]) -> Result<()> {
+        let db = self.db();
+        let artists = db.track_artists(tracks).await?;
+        let (mut track_ids, mut recordings, mut artist_ids, mut artist_mbids) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (t, r) in tracks.iter().zip(found) {
+            if let Some(m) = uuid(&r["recording_mbid"]) {
+                track_ids.push(*t);
+                recordings.push(Some(m));
+            }
+            if let (Some(a), Some(m)) = (artists.get(t), uuid(&r["artist_mbids"][0])) {
+                artist_ids.push(*a);
+                artist_mbids.push(m);
+            }
+        }
+        db.set_track_mbids(&track_ids, &recordings).await?;
+        db.set_artist_mbids(&artist_ids, &artist_mbids.iter().map(String::as_str).collect::<Vec<_>>()).await
+    }
+
+    /// The stored id of an artist, by name as typed or played. `None` when there is none (or the database fails:
+    /// callers fall back to searching by name).
+    pub(crate) async fn stored_artist_mbid(&self, artist: &str) -> Option<String> {
+        let (id, _) = self.db().find(Kind::Artist, artist, None).await.ok()??;
+        self.db().artist_mbids(&[id]).await.ok()?.remove(&id)
+    }
+
+    /// The stored recording id of a track, by names as typed or played.
+    pub(crate) async fn stored_track_mbid(&self, artist: &str, track: &str) -> Option<String> {
+        let (id, _) = self.db().find(Kind::Track, artist, Some(track)).await.ok()??;
+        self.db().track_facts(&[id]).await.ok()?.remove(&id)?.mbid
     }
 
     /// LB-wide (listeners, listens) of artists or recordings (`entity`: "artist", "recording") by id. Ids LB has
@@ -195,6 +220,15 @@ mod tests {
         assert_eq!(bot.track_facts(&[found, missing]).await?, facts);
         assert_eq!(bot.popularity("recording", &[rec]).await?[rec], (10, 1000));
         assert_eq!(server.await?.len(), 3);
+
+        // Cards and genres read the stored ids by name; a chart's lookup stores what it found.
+        assert_eq!(bot.stored_artist_mbid(&artist.to_uppercase()).await.as_deref(), Some(artist_mbid));
+        assert_eq!(bot.stored_track_mbid(&artist, "found").await.as_deref(), Some(rec));
+        assert_eq!(bot.stored_track_mbid(&artist, "Missing").await, None);
+        let chart_found = "13dd61c7-0000-4000-8000-000000000003";
+        bot.save_found(&[missing, new], &[serde_json::json!({"recording_mbid": chart_found}), serde_json::Value::Null]).await?;
+        assert_eq!(bot.stored_track_mbid(&artist, "Missing").await.as_deref(), Some(chart_found));
+        assert_eq!(bot.stored_track_mbid(&artist, "Unknown to LB").await.as_deref(), Some(new_rec), "a miss changes nothing");
         Ok(())
     }
 }
