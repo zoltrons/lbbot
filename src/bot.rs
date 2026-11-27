@@ -284,7 +284,7 @@ const HIST_SLASH: [(&str, &str, &str); 29] = [
     ("comebacks", "What you came back to after a break", "Period (week, month, year…) and artists/albums/tracks"),
     ("onthisday", "This day in earlier years, and songs released on it", ""),
     ("movers", "What climbed your all-time top", "Period (week, month, year…) and artists/albums/tracks"),
-    ("growth", "Your plays per year, or per month of a year, as a chart", "Year, or an artist"),
+    ("growth", "Your plays per year, or per month of a year, as a chart", "Year and/or artist, e.g. 2025 Radiohead"),
     ("obsessions", "Your biggest days with one song, and one-song artists", ""),
     ("hidden", "Tracks you play that few others on ListenBrainz do", "Period (week, month, year…)"),
     ("obscurity", "How underground your artists are, and who here is most", "Period (week, month, year…)"),

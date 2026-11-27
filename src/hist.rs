@@ -303,10 +303,10 @@ impl Bot {
                 let (from, label) = since(&o, Some(30), "month");
                 let e = self.summary(&h, from, i64::MAX, format!("Your {label}")).await?;
                 let mut footer = h.tz_note();
-                // Alistral's reports compare each period with the one before it; all time has none.
-                if from > i64::MIN {
+                // Alistral's reports compare each period with the one just before it, of the same length; all time has none.
+                if let Some(days) = o.period.as_ref().map_or(Some(30), |p| p.0) {
                     let plays = stats::range(&h.entries, from, i64::MAX).len();
-                    let before = stats::range(&h.entries, from - (now() - from), from).len();
+                    let before = stats::range(&h.entries, from - days * DAY, from).len();
                     if before > 0 {
                         footer = format!("{:+.0}% plays compared to the {label} before\n{footer}", (plays as f64 / before as f64 - 1.0) * 100.0);
                     }
@@ -333,7 +333,7 @@ impl Bot {
             Hc::Comebacks => self.comebacks(&h, &o).await?,
             Hc::OnThisDay => self.on_this_day(&h).await?,
             Hc::Movers => self.movers(&h, &o).await?,
-            Hc::Growth => return self.growth(ctx, user, &h, &o, note).await,
+            Hc::Growth => return self.growth(ctx, user, &h, arg, note).await,
             Hc::Obsessions => self.obsessions(&h).await?,
             Hc::Hidden => self.hidden(&h, &o).await?,
             Hc::Obscurity => self.obscurity(ctx, user, &h, &o).await?,

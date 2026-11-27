@@ -297,13 +297,14 @@ impl Db {
         Ok(())
     }
 
-    /// Facts read from MusicBrainz. A known length from MusicBrainz replaces the player's.
+    /// Facts read from MusicBrainz, for tracks that have none yet (a slower concurrent command doesn't overwrite).
+    /// A known length from MusicBrainz replaces the player's.
     pub async fn set_track_facts(&self, ids: &[i32], facts: &[crate::lb::RecordingFacts]) -> Result<()> {
         let lengths: Vec<i32> = facts.iter().map(|f| f.length_ms).collect();
         let released: Vec<i32> = facts.iter().map(|f| f.released).collect();
         sqlx::query(
             "UPDATE tracks t SET released = x.r, length_ms = CASE WHEN x.l > 0 THEN x.l ELSE coalesce(t.length_ms, 0) END
-             FROM unnest($1::int[], $2::int[], $3::int[]) x(id, l, r) WHERE t.id = x.id",
+             FROM unnest($1::int[], $2::int[], $3::int[]) x(id, l, r) WHERE t.id = x.id AND t.released IS NULL",
         )
         .bind(ids).bind(&lengths).bind(&released).execute(&self.0).await?;
         Ok(())
@@ -333,8 +334,9 @@ impl Db {
         Ok(())
     }
 
-    pub async fn set_obscurity(&self, user_id: i32, score: i16) -> Result<()> {
-        sqlx::query("UPDATE users SET obscurity = $2 WHERE id = $1").bind(user_id).bind(score).execute(&self.0).await?;
+    /// Only while the user is still on `lb_name`: a score computed before a switch of account is dropped.
+    pub async fn set_obscurity(&self, user_id: i32, lb_name: &str, score: i16) -> Result<()> {
+        sqlx::query("UPDATE users SET obscurity = $2 WHERE id = $1 AND lb_name = $3").bind(user_id).bind(score).bind(lb_name).execute(&self.0).await?;
         Ok(())
     }
 
@@ -728,6 +730,8 @@ mod tests {
         let found = "13dd61c7-0000-4000-8000-000000000001";
         db.set_track_mbids(&[tune, lone], &[None, Some(found.into())]).await?;
         db.set_track_facts(&[song], &[crate::lb::RecordingFacts { length_ms: 200_000, released: 19_940_822 }]).await?;
+        // A late answer for the same track doesn't replace what is known.
+        db.set_track_facts(&[song], &[crate::lb::RecordingFacts::default()]).await?;
         let facts = db.track_facts(&[song, tune, lone]).await?;
         assert_eq!(facts[&song], TrackFacts { mbid: Some(recording_mbid.into()), length_ms: Some(200_000), released: Some(19_940_822) });
         assert_eq!(facts[&tune], TrackFacts { mbid: None, length_ms: Some(180_000), released: Some(0) });
@@ -737,7 +741,8 @@ mod tests {
         assert_eq!(db.server_top_artists(210, 5).await?, [(o, 3), (a, 1)]);
         db.set_tz(u, Some("Europe/Istanbul")).await?;
         assert_eq!(db.user(u).await?.tz.as_deref(), Some("Europe/Istanbul"));
-        db.set_obscurity(u, 63).await?;
+        db.set_obscurity(u, "carol", 63).await?;
+        db.set_obscurity(u, "carols-old-account", 5).await?;
         assert_eq!(db.member_obscurity(210).await?, [(u, "Carol".to_owned(), 63)]);
         db.delete_user(u).await?;
         Ok(())

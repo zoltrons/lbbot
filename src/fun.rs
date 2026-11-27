@@ -24,6 +24,17 @@ fn footer(e: EmbedBuilder, text: impl Into<String>) -> EmbedBuilder {
     e.footer(EmbedFooterBuilder::new(text))
 }
 
+/// `,growth`'s argument: a leading year (1970 to `this`), then the artist exactly as typed, so "The 1975", "311" and
+/// "All Time Low" stay whole.
+fn year_and_artist(arg: &str, this: i64) -> (Option<i64>, &str) {
+    let arg = arg.trim();
+    let (first, rest) = arg.split_once(' ').unwrap_or((arg, ""));
+    match first.parse::<i64>().ok().filter(|y| (1970..=this).contains(y)) {
+        Some(y) => (Some(y), rest.trim()),
+        None => (None, arg),
+    }
+}
+
 /// "every 5 hours", "every 3 days".
 fn every(secs: i64) -> String {
     match secs {
@@ -149,13 +160,13 @@ impl Bot {
     }
 
     /// Plays per year (all time) or per month of a year, optionally for one artist, as a bar chart.
-    pub(crate) async fn growth(&self, ctx: &Ctx, user: &User, h: &Hist, o: &Opts, note: Option<&str>) -> Result<Out> {
+    pub(crate) async fn growth(&self, ctx: &Ctx, user: &User, h: &Hist, arg: &str, note: Option<&str>) -> Result<Out> {
         let this = stats::civil(h.today()).0;
-        let year = o.number.filter(|y| (1970..=this).contains(y));
-        let (name, artist) = if o.rest.trim().is_empty() {
+        let (year, artist_name) = year_and_artist(arg, this);
+        let (name, artist) = if artist_name.is_empty() {
             (None, None)
         } else {
-            match self.find_in(user, Kind::Artist, &o.rest).await? {
+            match self.find_in(user, Kind::Artist, artist_name).await? {
                 Ok((name, id)) => (Some(name), Some(id)),
                 Err(e) => return Ok(e.into()),
             }
@@ -250,7 +261,7 @@ impl Bot {
         let score = stats::underground(&rows.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>());
         // Only all-time scores are ranked, so everyone is compared over the same span.
         if from == i64::MIN {
-            self.db().set_obscurity(user.id, score.round() as i16).await?;
+            self.db().set_obscurity(user.id, &user.lb_name, score.round() as i16).await?;
         }
         rows.sort_by_key(|r| (r.2, r.0));
         // Up to 3 from each end; with few artists each one shows once (a single artist shows in both).
@@ -381,5 +392,12 @@ mod tests {
         assert_eq!(duration((37 * 60 + 12) * 60_000), "37h 12m");
         assert_eq!(duration((4 * 24 + 2) * 3_600_000), "4 days 2h");
         assert_eq!(percent(1.0, 0.0), 0.0);
+        assert_eq!(year_and_artist("The 1975", 2026), (None, "The 1975"));
+        assert_eq!(year_and_artist("311", 2026), (None, "311"));
+        assert_eq!(year_and_artist("All Time Low", 2026), (None, "All Time Low"));
+        assert_eq!(year_and_artist(" 2025  Radiohead ", 2026), (Some(2025), "Radiohead"));
+        assert_eq!(year_and_artist("2025", 2026), (Some(2025), ""));
+        assert_eq!(year_and_artist("2030 Radiohead", 2026), (None, "2030 Radiohead"), "a future year is part of the name");
+        assert_eq!(year_and_artist("", 2026), (None, ""));
     }
 }

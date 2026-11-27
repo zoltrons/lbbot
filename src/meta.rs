@@ -51,9 +51,9 @@ impl Bot {
         for chunk in todo.chunks(1000) {
             let mbids: Vec<&str> = chunk.iter().map(|c| c.1).collect();
             let got = lb.recording_facts(&mbids).await?;
-            let ids: Vec<i32> = chunk.iter().map(|c| c.0).collect();
-            // A recording LB doesn't return (merged into another) is stored as unknown, so it isn't asked again.
-            let rows: Vec<crate::lb::RecordingFacts> = chunk.iter().map(|c| got.get(c.1).copied().unwrap_or_default()).collect();
+            // A recording LB doesn't return stays unasked-for and is asked again by a later command: LB may not have
+            // a new release yet. (A merged recording keeps being asked; it rides along in requests made anyway.)
+            let (ids, rows): (Vec<i32>, Vec<crate::lb::RecordingFacts>) = chunk.iter().filter_map(|c| Some((c.0, *got.get(c.1)?))).unzip();
             db.set_track_facts(&ids, &rows).await?;
         }
         db.track_facts(tracks).await
@@ -156,12 +156,16 @@ mod tests {
             recording_msid: None,
             track_metadata: TrackMetadata { artist_name: artist.clone(), track_name: track.into(), ..Default::default() },
         };
-        let entries = db.intern(&[listen("Found"), listen("Missing")]).await?;
-        let (found, missing) = (entries[0].track, entries[1].track);
+        let entries = db.intern(&[listen("Found"), listen("Missing"), listen("Unknown to LB")]).await?;
+        let (found, missing, new) = (entries[0].track, entries[1].track, entries[2].track);
         let (artist_mbid, rec) = ("8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", "e97f805a-ab48-4c52-855e-07049142113d");
+        let new_rec = "13dd61c7-0000-4000-8000-000000000002";
         let responses = vec![
-            // LB matches the first track only.
-            (200, 10, leak(format!(r#"[{{"index": 0, "artist_credit_name": "{artist}", "artist_mbids": ["{artist_mbid}"], "recording_mbid": "{rec}"}}]"#))),
+            // LB matches the first and third track; it has no facts yet for the third.
+            (200, 10, leak(format!(
+                r#"[{{"index": 0, "artist_credit_name": "{artist}", "artist_mbids": ["{artist_mbid}"], "recording_mbid": "{rec}"}},
+                    {{"index": 2, "artist_credit_name": "{artist}", "artist_mbids": ["{artist_mbid}"], "recording_mbid": "{new_rec}"}}]"#
+            ))),
             (200, 10, leak(format!(r#"{{"{rec}": {{"recording": {{"length": 238000, "first_release_date": "1994-08-22"}}, "release": {{}}}}}}"#))),
             (200, 10, leak(format!(r#"[{{"recording_mbid": "{rec}", "total_listen_count": 1000, "total_user_count": 10}}]"#))),
         ];
@@ -179,9 +183,10 @@ mod tests {
             owner: None,
         };
 
-        let facts = bot.track_facts(&[found, missing]).await?;
+        let mut facts = bot.track_facts(&[found, missing, new]).await?;
         assert_eq!(facts[&found], TrackFacts { mbid: Some(rec.into()), length_ms: Some(238_000), released: Some(19_940_822) });
         assert_eq!(facts[&missing], TrackFacts { mbid: None, length_ms: Some(0), released: Some(0) }, "marked as looked up");
+        assert_eq!(facts.remove(&new), Some(TrackFacts { mbid: Some(new_rec.into()), length_ms: None, released: None }), "left to ask again");
         let artist_id = bot.db().track_artists(&[found]).await?[&found];
         assert_eq!(bot.artist_mbids(&[artist_id]).await?[&artist_id], artist_mbid, "stored by the track lookup");
         assert_eq!(bot.popularity("recording", &[rec]).await?[rec], (10, 1000));
