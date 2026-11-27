@@ -1,9 +1,8 @@
 //! The `.iceberg` picture: an SVG drawn here, rendered to PNG with resvg. Tiers go from the tip down.
 
-use std::sync::{Arc, OnceLock};
+use anyhow::Result;
 
-use anyhow::{Context, Result};
-use resvg::{tiny_skia, usvg};
+use crate::draw::{DISPLAY, FALLBACK, MONO, SANS, clip, xml};
 
 const W: f32 = 640.0;
 const H: f32 = 960.0;
@@ -11,39 +10,11 @@ const WATER: f32 = 330.0;
 /// The tip tier is the sky above the water; the other tiers split the sea evenly down to `BOTTOM`.
 const TIP_TOP: f32 = 168.0;
 const BOTTOM: f32 = 930.0;
-/// Bundled fonts (assets/fonts, OFL) first; system fonts cover what they lack, such as CJK.
-const FALLBACK: &str = "DejaVu Sans, Noto Sans CJK JP, WenQuanYi Zen Hei, sans-serif";
-const DISPLAY: &str = "Bricolage Grotesque";
-const SANS: &str = "Inter";
-const MONO: &str = "JetBrains Mono";
-const BUNDLED: [&[u8]; 3] = [
-    include_bytes!("../assets/fonts/BricolageGrotesque-ExtraBold.ttf"),
-    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
-    include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf"),
-];
 /// Zone names next to `stats::TIERS`, top first.
 const ZONES: [&str; 6] = ["THE TIP", "SHALLOWS", "TWILIGHT ZONE", "MIDNIGHT ZONE", "THE ABYSS", "THE TRENCH"];
 
-/// Loaded once. The Docker image installs DejaVu and a CJK font; glyphs no font has render as nothing.
-static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
-
 pub fn render(title: &str, label: &str, tiers: &[Vec<String>]) -> Result<Vec<u8>> {
-    let fontdb = FONTS
-        .get_or_init(|| {
-            let mut db = usvg::fontdb::Database::new();
-            for font in BUNDLED {
-                db.load_font_data(font.to_vec());
-            }
-            db.load_system_fonts();
-            Arc::new(db)
-        })
-        .clone();
-    let opt = usvg::Options { font_family: SANS.into(), fontdb, ..Default::default() };
-    let tree = usvg::Tree::from_str(&svg(title, label, tiers), &opt)?;
-    let size = tree.size().to_int_size();
-    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height()).context("empty iceberg image")?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
-    Ok(pixmap.encode_png()?)
+    crate::draw::png(&svg(title, label, tiers))
 }
 
 /// Top and bottom of each tier band.
@@ -181,15 +152,6 @@ fn svg(title: &str, label: &str, tiers: &[Vec<String>]) -> String {
         H - 12.0
     ));
     s
-}
-
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_owned() } else { format!("{}…", s.chars().take(max - 1).collect::<String>()) }
-}
-
-/// Escapes text for the SVG and drops control characters, which XML forbids (broken tags sometimes carry them).
-fn xml(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect::<String>().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 #[cfg(test)]

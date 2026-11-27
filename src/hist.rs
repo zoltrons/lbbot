@@ -24,13 +24,14 @@ use crate::{
 };
 
 /// A user's history with each track's artist, so any kind can be counted.
-struct Hist {
-    entries: Vec<Entry>,
-    artist: HashMap<i32, i32>,
+pub(crate) struct Hist {
+    pub entries: Vec<Entry>,
+    /// The artist of each track.
+    pub artist: HashMap<i32, i32>,
 }
 
 impl Hist {
-    fn key(&self, kind: Kind) -> impl Fn(&Entry) -> Option<i32> + '_ {
+    pub(crate) fn key(&self, kind: Kind) -> impl Fn(&Entry) -> Option<i32> + '_ {
         move |e| match kind {
             Kind::Artist => self.artist.get(&e.track).copied(),
             Kind::Album => (e.album != 0).then_some(e.album),
@@ -73,7 +74,7 @@ fn opts(arg: &str) -> Opts {
 }
 
 /// The Discord id in a `<@id>` or `<@!id>` mention at the start of `arg`, and what follows it.
-fn mention(arg: &str) -> Option<(i64, &str)> {
+pub(crate) fn mention(arg: &str) -> Option<(i64, &str)> {
     let inner = arg.strip_prefix("<@")?;
     let (id, rest) = inner.split_once('>')?;
     Some((id.trim_start_matches('!').parse().ok()?, rest.trim()))
@@ -113,7 +114,7 @@ pub(crate) fn overview_button(id: &str) -> Option<(i64, i64, usize)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-fn with_note(mut embed: Embed, note: Option<&str>) -> Embed {
+pub(crate) fn with_note(mut embed: Embed, note: Option<&str>) -> Embed {
     if let Some(n) = note {
         let footer = embed.footer.take().map_or(n.to_owned(), |f| format!("{}\n{n}", f.text));
         embed.footer = Some(EmbedFooterBuilder::new(footer).build());
@@ -125,7 +126,7 @@ fn today() -> i64 {
     now().div_euclid(DAY)
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
@@ -164,7 +165,7 @@ fn ordinal(n: i64) -> String {
     format!("{n}{suffix}")
 }
 
-fn kind_word(kind: Kind) -> &'static str {
+pub(crate) fn kind_word(kind: Kind) -> &'static str {
     match kind {
         Kind::Artist => "artists",
         Kind::Album => "albums",
@@ -324,7 +325,7 @@ impl Bot {
         tags
     }
 
-    async fn load(&self, user_id: i32) -> Result<Hist> {
+    pub(crate) async fn load(&self, user_id: i32) -> Result<Hist> {
         let entries = self.db().history(user_id).await?;
         let mut tracks: Vec<i32> = entries.iter().map(|e| e.track).collect();
         tracks.sort_unstable();
@@ -566,7 +567,7 @@ fn embed(title: String, desc: String) -> EmbedBuilder {
     e
 }
 
-fn capitalized(s: &str) -> String {
+pub(crate) fn capitalized(s: &str) -> String {
     let mut c = s.chars();
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }

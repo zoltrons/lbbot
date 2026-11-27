@@ -369,14 +369,18 @@ impl Db {
 
     /// Display names: the artist, or `Artist - Name` for albums and tracks.
     pub async fn names(&self, kind: Kind, ids: &[i32]) -> Result<HashMap<i32, String>> {
-        let sql = match kind {
-            Kind::Artist => "SELECT id, name FROM artists WHERE id = ANY($1)".to_owned(),
-            _ => format!(
-                "SELECT t.id, a.name || ' - ' || t.name FROM {} t JOIN artists a ON a.id = t.artist_id WHERE t.id = ANY($1)",
-                if kind == Kind::Album { "albums" } else { "tracks" }
-            ),
-        };
-        Ok(sqlx::query_as(AssertSqlSafe(sql)).bind(ids).fetch_all(&self.0).await?.into_iter().collect())
+        if kind == Kind::Artist {
+            return Ok(sqlx::query_as("SELECT id, name FROM artists WHERE id = ANY($1)").bind(ids).fetch_all(&self.0).await?.into_iter().collect());
+        }
+        Ok(self.name_parts(kind, ids).await?.into_iter().map(|(id, (artist, name))| (id, format!("{artist} - {name}"))).collect())
+    }
+
+    /// (artist, name) of albums or tracks.
+    pub async fn name_parts(&self, kind: Kind, ids: &[i32]) -> Result<HashMap<i32, (String, String)>> {
+        let table = if kind == Kind::Album { "albums" } else { "tracks" };
+        let sql = format!("SELECT t.id, a.name, t.name FROM {table} t JOIN artists a ON a.id = t.artist_id WHERE t.id = ANY($1)");
+        let rows: Vec<(i32, String, String)> = sqlx::query_as(AssertSqlSafe(sql)).bind(ids).fetch_all(&self.0).await?;
+        Ok(rows.into_iter().map(|(id, artist, name)| (id, (artist, name))).collect())
     }
 
     /// Server members' plays of the given artists, with their name and total listens: (user id, name, total, artist, plays).

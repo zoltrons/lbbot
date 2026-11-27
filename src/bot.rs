@@ -52,6 +52,8 @@ pub struct Bot {
     pub featured: Arc<crate::featured::Featured>,
     /// Discord id of the application owner, for owner-only commands.
     pub owner: Option<i64>,
+    /// Charts per Discord id in the current window (see `chart::allow`).
+    pub chart_uses: std::sync::Mutex<HashMap<i64, (std::time::Instant, u8)>>,
 }
 
 /// (artist, album or track name, (playing track name, its mapping))
@@ -84,6 +86,8 @@ enum Cmd {
     FeaturedBlock,
     /// Commands computed from the stored history; `arg` is the rest of the text, parsed by each command.
     Hist { cmd: Hc, kind: Kind, arg: String },
+    /// An image chart; `artist` is a name still to look up, `private` the slash option.
+    Chart { chart: crate::chart::Chart, artist: Option<String>, private: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,7 +133,7 @@ fn failed(e: anyhow::Error) -> Out {
     error_reply(e).into()
 }
 
-fn login_first() -> Embed {
+pub(crate) fn login_first() -> Embed {
     reply(format!("Connect your ListenBrainz account with `/login` first. You'll need your **User token** from {SETTINGS}."))
 }
 
@@ -142,7 +146,16 @@ fn parse_text(word: &str, rest: &str) -> Option<Cmd> {
     let query = (!rest.is_empty()).then(|| rest.to_owned());
     let wk = |kind, global| Some(Cmd::Wk { kind, global, query: query.clone() });
     let hist = |cmd, kind| Some(Cmd::Hist { cmd, kind, arg: rest.to_owned() });
+    let chart = |kind, arg: &str| {
+        let (chart, artist) = crate::chart::parse(kind, arg);
+        Some(Cmd::Chart { chart, artist, private: false })
+    };
     match word {
+        "chart" | "c" | "topster" | "topsters" => chart(Kind::Album, rest),
+        "aoty" | "albumsoftheyear" | "albumoftheyear" => chart(Kind::Album, &format!("aoty {rest}")),
+        "aotd" | "albumsofthedecade" | "albumofthedecade" => chart(Kind::Album, &format!("aotd {rest}")),
+        "artistchart" | "ac" | "top" | "ca" | "chartartist" | "chartartists" | "artistcharts" => chart(Kind::Artist, rest),
+        "trackchart" | "tc" | "charttrack" | "charttracks" | "trackcharts" => chart(Kind::Track, rest),
         "overview" | "o" | "ov" => hist(Hc::Overview, Kind::Artist),
         "streak" | "str" | "combo" | "cb" => hist(Hc::Streak, Kind::Artist),
         "streaks" | "combos" | "streakhistory" => hist(Hc::Streaks, Kind::Artist),
@@ -222,6 +235,7 @@ pub fn slash_commands() -> Vec<Command> {
         }
         out.push(c.build());
     }
+    out.push(crate::chart::slash_command());
     out
 }
 
@@ -270,6 +284,12 @@ fn parse_slash(data: &CommandData) -> Option<Cmd> {
         }),
         "help" => Some(Cmd::Help),
         "refreshmembers" => Some(Cmd::RefreshMembers),
+        "chart" => {
+            let sub = data.options.first()?;
+            let CommandOptionValue::SubCommand(options) = &sub.value else { return None };
+            let (chart, artist, private) = crate::chart::from_slash(&sub.name, options);
+            Some(Cmd::Chart { chart, artist, private })
+        }
         name if HIST_SLASH.iter().any(|(n, ..)| *n == name) => {
             let alias = match (name, string("type").as_deref()) {
                 ("discoverydate", Some("album")) => "dda",
@@ -417,9 +437,7 @@ impl Bot {
                         }
                         None => "This command only works in servers.",
                     };
-                    let resp = ChannelMessageBuilder::new().embeds([reply(text)]).flags(MessageFlags::EPHEMERAL).build();
-                    client.create_response(i.id, &i.token, &resp).await?;
-                    return Ok(());
+                    return self.ephemeral(i, text).await;
                 }
                 if cmd == Cmd::Login {
                     #[allow(deprecated)] // `label` now lives on the Label component
@@ -450,32 +468,58 @@ impl Bot {
                     client.create_response(i.id, &i.token, &resp).await?;
                     return Ok(());
                 }
-                let ephemeral = matches!(cmd, Cmd::Privacy | Cmd::Remove { .. } | Cmd::Prefix(_));
+                let ephemeral = matches!(cmd, Cmd::Privacy | Cmd::Remove { .. } | Cmd::Prefix(_) | Cmd::Chart { private: true, .. });
                 self.defer(i, ephemeral).await?;
                 let out = self.run(&ctx, cmd).await.unwrap_or_else(failed);
                 client.update_response(&i.token).embeds(Some(&[out.embed])).components(Some(&out.components)).attachments(&out.files).await?;
             }
             Some(InteractionData::MessageComponent(data)) => {
+                if let Some((owner, chart)) = crate::chart::from_button(&data.custom_id) {
+                    if owner != ctx.discord_id {
+                        return self.ephemeral(i, "Only the person who ran the command can edit this chart.").await;
+                    }
+                    client.create_response(i.id, &i.token, &crate::chart::modal(owner, &chart)).await?;
+                    return Ok(());
+                }
                 let Some((owner, today, page)) = crate::hist::overview_button(&data.custom_id) else { return Ok(()) };
                 if owner != ctx.discord_id {
-                    let text = "Only the person who ran the command can turn its pages.";
-                    let resp = ChannelMessageBuilder::new().embeds([reply(text)]).flags(MessageFlags::EPHEMERAL).build();
-                    client.create_response(i.id, &i.token, &resp).await?;
-                    return Ok(());
+                    return self.ephemeral(i, "Only the person who ran the command can turn its pages.").await;
                 }
                 let resp = InteractionResponse { kind: InteractionResponseType::DeferredUpdateMessage, data: None };
                 client.create_response(i.id, &i.token, &resp).await?;
                 let out = self.overview_turn(&ctx, today, page).await.unwrap_or_else(failed);
                 client.update_response(&i.token).embeds(Some(&[out.embed])).components(Some(&out.components)).await?;
             }
+            Some(InteractionData::ModalSubmit(data)) if data.custom_id.starts_with("chm:") => {
+                let value = |id: &str| data.components.iter().find_map(|c| modal_values(c, id)).unwrap_or_default();
+                let Some((owner, chart)) = crate::chart::from_modal(&data.custom_id, value) else { return Ok(()) };
+                if owner != ctx.discord_id {
+                    return self.ephemeral(i, "Only the person who ran the command can edit this chart.").await;
+                }
+                let resp = InteractionResponse { kind: InteractionResponseType::DeferredUpdateMessage, data: None };
+                client.create_response(i.id, &i.token, &resp).await?;
+                // An error keeps the Edit button, so a hiccup doesn't end the chart.
+                let out = self.chart(&ctx, &chart).await.unwrap_or_else(|e| Out { components: vec![crate::chart::edit_button(owner, &chart)], ..failed(e) });
+                // Keeping no old attachments drops the previous picture, also when the new reply has none.
+                let embeds = [out.embed];
+                let update = client.update_response(&i.token).embeds(Some(&embeds)).components(Some(&out.components));
+                update.keep_attachment_ids(&[]).attachments(&out.files).await?;
+            }
             Some(InteractionData::ModalSubmit(data)) if data.custom_id == "login" => {
                 self.defer(i, true).await?;
-                let token = data.components.iter().find_map(text_value).unwrap_or_default();
+                let token = data.components.iter().find_map(|c| modal_values(c, "token")).and_then(|v| v.into_iter().next()).unwrap_or_default();
                 let out = self.login(&ctx, token.trim(), &i.token).await.unwrap_or_else(error_reply);
                 client.update_response(&i.token).embeds(Some(&[out])).await?;
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// A reply only the person who pressed or typed sees.
+    async fn ephemeral(&self, i: &Interaction, text: &str) -> Result<()> {
+        let resp = ChannelMessageBuilder::new().embeds([reply(text)]).flags(MessageFlags::EPHEMERAL).build();
+        self.http.interaction(self.app_id).create_response(i.id, &i.token, &resp).await?;
         Ok(())
     }
 
@@ -556,6 +600,15 @@ impl Bot {
                 Some(user) => self.hist(ctx, &user, cmd, kind, &arg).await,
                 None => Ok(login_first().into()),
             },
+            Cmd::Chart { mut chart, artist, .. } => {
+                if let Some(name) = artist {
+                    match self.db().find(Kind::Artist, &name, None).await? {
+                        Some((id, _)) => chart.artist = Some(id),
+                        None => return Ok(reply(format!("No one on the bot has listened to **{}**.", escape(&name))).into()),
+                    }
+                }
+                self.chart(ctx, &chart).await
+            }
             cmd => Ok(self.run_embed(ctx, cmd).await?.into()),
         }
     }
@@ -687,7 +740,9 @@ impl Bot {
                 self.db().delete_user(user.id).await?;
                 Ok(reply("Your account and all your data were deleted."))
             }
-            Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock | Cmd::Hist { .. } => unreachable!("handled above"),
+            Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock | Cmd::Hist { .. } | Cmd::Chart { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
@@ -779,7 +834,7 @@ impl Bot {
     }
 
     /// Card image and tags, from the cache or `fetch_art`. An error doesn't break the card and isn't cached.
-    async fn art(&self, kind: Kind, artist: &str, track: Option<&str>, album: Option<&str>, mapping: Value) -> Art {
+    pub(crate) async fn art(&self, kind: Kind, artist: &str, track: Option<&str>, album: Option<&str>, mapping: Value) -> Art {
         let name = match kind {
             Kind::Artist => "",
             Kind::Album => album.unwrap_or_default(),
@@ -960,7 +1015,7 @@ fn has_crown(kind: Kind, global: bool, plays: &[i32]) -> bool {
 
 /// (read key, name key). The mapping's artist id is more certain than the name: when present it is the read key
 /// (third field "mbid" so it can't collide with a name key); otherwise both are the same.
-fn art_keys(kind: Kind, artist: &str, name: &str, mapping: &Value) -> (ArtKey, ArtKey) {
+pub(crate) fn art_keys(kind: Kind, artist: &str, name: &str, mapping: &Value) -> (ArtKey, ArtKey) {
     let name_key = (kind, artist.to_lowercase(), name.to_lowercase());
     let mbid = (kind == Kind::Artist).then(|| mapping["artist_mbids"].get(0).and_then(Value::as_str)).flatten();
     (mbid.map_or_else(|| name_key.clone(), |m| (kind, m.to_owned(), "mbid".into())), name_key)
@@ -992,11 +1047,14 @@ fn with_art(mut embed: EmbedBuilder, art: Art) -> Embed {
     embed.build()
 }
 
-fn text_value(c: &ModalInteractionComponent) -> Option<String> {
+/// The answer of the form field `id`: a text, or the picked options.
+fn modal_values(c: &ModalInteractionComponent, id: &str) -> Option<Vec<String>> {
     match c {
-        ModalInteractionComponent::TextInput(t) if t.custom_id == "token" => Some(t.value.clone()),
-        ModalInteractionComponent::Label(l) => text_value(&l.component),
-        ModalInteractionComponent::ActionRow(r) => r.components.iter().find_map(text_value),
+        ModalInteractionComponent::TextInput(t) if t.custom_id == id => Some(vec![t.value.clone()]),
+        ModalInteractionComponent::StringSelect(s) if s.custom_id == id => Some(s.values.clone()),
+        ModalInteractionComponent::CheckboxGroup(g) if g.custom_id == id => Some(g.values.clone()),
+        ModalInteractionComponent::Label(l) => modal_values(&l.component, id),
+        ModalInteractionComponent::ActionRow(r) => r.components.iter().find_map(|c| modal_values(c, id)),
         _ => None,
     }
 }
@@ -1030,6 +1088,7 @@ const HELP: &str = "**Commands** (default prefix `,`; each one also exists as a 
 `,o`: last days · `,streak` `,streaks` · `,gaps` · `,discoveries` · `,dd` `,ll`: first / last listen
 `,pace` `,apc`: when you'll hit a play count · `,ms`: your nth listen
 `,year` `,recap` `,receipt` `,iceberg` · `,taste @user` · `,aff`: who listens like you here
+`,c` `,ac` `,tc`: album / artist / track chart, e.g. `,c 4x4 month nt pc s`, with an Edit button
 `,update`: fetch your latest listens
 `,privacy`: show or hide yourself in global lists
 `,remove`: delete your account and data
@@ -1053,6 +1112,10 @@ mod tests {
         assert_eq!(parse_text("np", ""), Some(Cmd::Np));
         assert_eq!(parse_text("dda", "a - b"), Some(Cmd::Hist { cmd: Hc::DiscoveryDate, kind: Kind::Album, arg: "a - b".into() }));
         assert!(matches!(parse_text("o", "3"), Some(Cmd::Hist { cmd: Hc::Overview, .. })));
+        assert!(matches!(parse_text("c", "4x4 Radiohead"), Some(Cmd::Chart { chart, artist: Some(a), private: false }) if chart.cols == 4 && a == "Radiohead"));
+        assert!(matches!(parse_text("ac", ""), Some(Cmd::Chart { chart, artist: None, .. }) if chart.kind == Kind::Artist));
+        assert!(matches!(parse_text("tc", ""), Some(Cmd::Chart { chart, .. }) if chart.kind == Kind::Track));
+        assert!(matches!(parse_text("aoty", "2020"), Some(Cmd::Chart { chart, artist: None, .. }) if chart.year == Some(2020)));
     }
 
     #[test]
@@ -1103,7 +1166,7 @@ mod tests {
 
     #[test]
     fn slash_list_and_escape() {
-        assert_eq!(slash_commands().len(), 30);
+        assert_eq!(slash_commands().len(), 31);
         assert_eq!(escape("a*b_c"), "a\\*b\\_c");
         assert_eq!(link_text("Vignette (Live In Mexico City)"), "Vignette (Live In Mexico City)");
         assert_eq!(link_text("Song [Remix]"), "Song (Remix)");

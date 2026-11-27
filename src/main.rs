@@ -1,6 +1,8 @@
 mod bot;
+mod chart;
 mod crypto;
 mod db;
+mod draw;
 mod featured;
 mod hist;
 mod iceberg;
@@ -69,6 +71,7 @@ async fn main() -> Result<()> {
         art_cache: Default::default(),
         featured,
         owner,
+        chart_uses: Default::default(),
     });
 
     let intents = Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
