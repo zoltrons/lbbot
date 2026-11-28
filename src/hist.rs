@@ -265,7 +265,7 @@ impl Bot {
                     Ok((name, id)) => {
                         let key = h.key(Kind::Artist);
                         let total = h.entries.iter().filter(|e| key(e) == Some(id)).count() as i64;
-                        let goal = goal.unwrap_or_else(|| stats::next_goal(total, true));
+                        let goal = goal.filter(|&g| g > 0).unwrap_or_else(|| stats::next_goal(total, true));
                         pace_embed(&format!("Your pace for {name}"), &Opts::default(), total, goal, &h.entries, |e| key(e) == Some(id))
                     }
                     Err(e) => return Ok(e.into()),
@@ -667,5 +667,7 @@ mod tests {
         assert_eq!(goal_and_name("Radiohead"), (None, "Radiohead"));
         assert_eq!(goal_and_name("311"), (None, "311"), "a lone number is an artist");
         assert_eq!(goal_and_name("The 1975"), (None, "The 1975"));
+        assert_eq!(goal_and_name("0 50 Cent"), (Some(0), "50 Cent"), "slash: goal 0 is the default goal");
+        assert_eq!(goal_and_name("500 "), (Some(500), ""), "slash: no artist is what's playing");
     }
 }

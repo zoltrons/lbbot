@@ -37,6 +37,11 @@ use crate::{
     stats::{self, DAY},
 };
 
+/// Slash sizes; the text command takes any up to 100 images.
+const SIZES: [(&str, &str); 12] = [
+    ("2x2 (4)", "2x2"), ("3x3 (9)", "3x3"), ("4x4 (16)", "4x4"), ("5x5 (25)", "5x5"), ("6x6 (36)", "6x6"), ("7x7 (49)", "7x7"),
+    ("8x8 (64)", "8x8"), ("10x10 (100)", "10x10"), ("5x4 (20)", "5x4"), ("6x4 (24)", "6x4"), ("8x5 (40)", "8x5"), ("10x5 (50)", "10x5"),
+];
 /// fmbot's period choices; `None` = all time. Their values in forms and slash choices are the day count, 0 for all time.
 const PERIODS: [(&str, Option<i64>); 6] =
     [("Weekly", Some(7)), ("Monthly", Some(30)), ("Quarterly", Some(90)), ("Half-yearly", Some(182)), ("Yearly", Some(365)), ("All time", None)];
@@ -215,7 +220,7 @@ pub(crate) fn slash_command() -> Command {
     let choices = PERIODS.map(|(label, d)| (label, d.unwrap_or(0).to_string()));
     let common = |sub: SubCommandBuilder, what: &str| {
         sub.option(StringBuilder::new("time-period", "Time period (default: weekly)").required(false).choices(choices.clone()))
-            .option(StringBuilder::new("size", "Chart size, e.g. 3x3 or 5x4 (up to 100 images)").required(false))
+            .option(StringBuilder::new("size", "Chart size (default: 3x3)").required(false).choices(SIZES))
             .option(StringBuilder::new("titles", "Title display setting").required(false).choices([
                 ("Titles", "titles"),
                 ("No titles", "nt"),
@@ -226,7 +231,7 @@ pub(crate) fn slash_command() -> Command {
             .option(BooleanBuilder::new("rainbow", "Sort by cover color").required(false))
             .option(BooleanBuilder::new("private", "Only show the response to you").required(false))
     };
-    let artist = || StringBuilder::new("artist", "Only this artist").required(false);
+    let artist = || StringBuilder::new("artist", "Only this artist").required(false).autocomplete(true);
     let decades = (195..=this_year() / 10).map(|d| (format!("{}s", d * 10), d * 10));
     let albums = SubCommandBuilder::new("albums", "Generates an album image chart")
         .option(artist())

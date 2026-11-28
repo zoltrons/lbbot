@@ -57,7 +57,7 @@ The bot writes logs to standard output, and the person running it decides how lo
 
 Your data stays until you delete it. Nothing expires on its own, including for users who stopped using the bot. When the bot is removed from a server, it deletes that server's member list and prefix.
 
-Downloaded export files are readable only by the bot's own system account and are deleted as soon as they are read. Cover images, photos and tags are cached in memory for up to 24 hours and are gone when the bot restarts.
+Downloaded export files are readable only by the bot's own system account and are deleted as soon as they are read. Cover images, photos and tags are cached in memory for up to 24 hours and are gone when the bot restarts. The suggestions shown while you type a slash command (your top artists, albums and tracks with play counts) are kept in memory for up to 20 minutes, and dropped at once when you run `/remove` or `/login` again.
 
 ## Deleting your data
 

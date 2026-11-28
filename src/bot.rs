@@ -8,7 +8,7 @@ use twilight_gateway::{Event, MessageSender};
 use twilight_http::Client;
 use twilight_model::{
     application::{
-        command::{Command, CommandOptionChoice, CommandOptionChoiceValue, CommandType},
+        command::{Command, CommandType},
         interaction::{
             Interaction, InteractionData, InteractionType,
             application_command::{CommandData, CommandOptionValue},
@@ -30,7 +30,7 @@ use twilight_model::{
 };
 use twilight_util::builder::{
     interaction_response::{ChannelMessageBuilder, ModalBuilder},
-    command::{BooleanBuilder, CommandBuilder, StringBuilder, UserBuilder},
+    command::{BooleanBuilder, CommandBuilder, IntegerBuilder, StringBuilder, UserBuilder},
     embed::{EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder, ImageSource},
 };
 
@@ -56,6 +56,8 @@ pub struct Bot {
     pub owner: Option<i64>,
     /// Charts per Discord id in the current window (see `chart::allow`).
     pub chart_uses: std::sync::Mutex<HashMap<i64, (std::time::Instant, u8)>>,
+    /// Autocomplete lists per Discord id (see `suggest`).
+    pub suggest_cache: crate::suggest::Cache,
 }
 
 /// (artist, album or track name, (playing track name, its mapping))
@@ -231,7 +233,7 @@ fn parse_text(word: &str, rest: &str) -> Option<Cmd> {
 
 pub fn slash_commands() -> Vec<Command> {
     let cmd = |name: &str, desc: &str| CommandBuilder::new(name, desc, CommandType::ChatInput);
-    let query = |desc: &str| StringBuilder::new("query", desc).required(false);
+    let query = |desc: &str| StringBuilder::new("query", desc).required(false).autocomplete(true);
     let mut out = vec![
         cmd("login", "Connect your ListenBrainz account").build(),
         cmd("update", "Fetch your latest listens").build(),
@@ -258,17 +260,35 @@ pub fn slash_commands() -> Vec<Command> {
             .option(StringBuilder::new("zone", "City or time zone, e.g. Istanbul").required(false).autocomplete(true))
             .build(),
     ];
-    for (name, desc, hint) in HIST_SLASH {
+    let period = || StringBuilder::new("time-period", "Time period").required(false).choices(PERIOD_CHOICES);
+    let kind = || StringBuilder::new("type", "Artists, albums or tracks (default: artists)").required(false).choices(KIND_CHOICES);
+    let this_year = crate::stats::civil(crate::hist::now().div_euclid(crate::stats::DAY)).0;
+    let years = || (this_year - 24..=this_year).rev().map(|y| (y.to_string(), y));
+    for (name, desc) in HIST_SLASH {
         let mut c = cmd(name, desc);
-        if matches!(name, "discoverydate" | "lastlistened") {
-            let kind = StringBuilder::new("type", "Artist, album or track").required(false);
-            c = c.option(kind.choices([("Artist", "artist"), ("Album", "album"), ("Track", "track")]));
-        }
-        if name == "taste" {
-            c = c.option(UserBuilder::new("user", "Who to compare with").required(true));
-        }
-        if !hint.is_empty() {
-            c = c.option(StringBuilder::new("options", hint).required(false));
+        match name {
+            "streaks" | "gaps" | "overdue" => c = c.option(kind()),
+            "discoveries" | "comebacks" | "movers" => c = c.option(period()).option(kind()),
+            "discoverydate" | "lastlistened" => {
+                c = c.option(kind()).option(StringBuilder::new("query", "Artist, or Artist - Name (default: what you're playing)").required(false).autocomplete(true))
+            }
+            "pace" => c = c.option(IntegerBuilder::new("goal", "Play count to reach (default: the next round number)").min_value(1).required(false).autocomplete(true)).option(period()),
+            "artistpace" => {
+                c = c
+                    .option(StringBuilder::new("artist", "Artist (default: what you're playing)").required(false).autocomplete(true))
+                    .option(IntegerBuilder::new("goal", "Play count to reach (default: the next round number)").min_value(1).required(false).autocomplete(true))
+            }
+            "milestone" => c = c.option(IntegerBuilder::new("number", "Listen number (default: your last round milestone)").min_value(1).required(false).autocomplete(true)),
+            // Discord allows 25 choices; older years still work with the text command.
+            "year" => c = c.option(IntegerBuilder::new("year", "Year (default: this year)").required(false).choices(years())),
+            "taste" => c = c.option(UserBuilder::new("user", "Who to compare with").required(true)).option(period()),
+            "recap" | "iceberg" | "receipt" | "hidden" | "obscurity" | "decades" | "listeningtime" | "clock" => c = c.option(period()),
+            "growth" => {
+                c = c
+                    .option(IntegerBuilder::new("year", "Plays per month of this year (default: plays per year)").required(false).choices(years()))
+                    .option(StringBuilder::new("artist", "Only this artist").required(false).autocomplete(true))
+            }
+            _ => {}
         }
         out.push(c.build());
     }
@@ -276,37 +296,42 @@ pub fn slash_commands() -> Vec<Command> {
     out
 }
 
-/// Slash versions of the history commands: (name, description, hint for the free-text options; empty = none).
-const HIST_SLASH: [(&str, &str, &str); 29] = [
-    ("overview", "Your last days: plays, genres and top artist, album and track per day", ""),
-    ("streak", "Your current artist, album and track streak", ""),
-    ("streaks", "Your longest streaks", "artists, albums or tracks"),
-    ("gaps", "What you came back to after the longest break", "artists, albums or tracks"),
-    ("discoveries", "Artists you discovered recently", "Period (week, month, year, 90d…) and artists/albums/tracks"),
-    ("discoverydate", "When you first listened to something", "Artist or Artist - Name"),
-    ("lastlistened", "When you last listened to something", "Artist or Artist - Name"),
-    ("pace", "When you'll reach a play count", "Goal and period, e.g. 50000 week"),
-    ("artistpace", "When you'll reach a play count for an artist", "Goal and artist, e.g. 1000 Radiohead"),
-    ("milestone", "Your nth listen", "Listen number"),
-    ("year", "Your year in music", "Year"),
-    ("recap", "Summary of a period", "Period (week, month, year, 90d…)"),
-    ("taste", "Compare your taste with someone", "Period (week, month, year…)"),
-    ("affinity", "Who in this server listens most like you", ""),
-    ("iceberg", "Your artists by how known they are on ListenBrainz", "Period (week, month, year…)"),
-    ("receipt", "Your top tracks as a receipt", "Period (week, month, year…)"),
-    ("overdue", "What you used to play often and haven't lately", "artists, albums or tracks"),
-    ("comebacks", "What you came back to after a break", "Period (week, month, year…) and artists/albums/tracks"),
-    ("onthisday", "This day in earlier years, and songs released on it", ""),
-    ("movers", "What climbed your all-time top", "Period (week, month, year…) and artists/albums/tracks"),
-    ("growth", "Your plays per year, or per month of a year, as a chart", "Year and/or artist, e.g. 2025 Radiohead"),
-    ("obsessions", "Your biggest days with one song, and one-song artists", ""),
-    ("hidden", "Tracks you play that few others on ListenBrainz do", "Period (week, month, year…)"),
-    ("obscurity", "How underground your artists are, and who here is most", "Period (week, month, year…)"),
-    ("servericeberg", "This server's top artists by how known they are", ""),
-    ("decades", "When the music you play came out, as a chart", "Period (week, month, year…)"),
-    ("listeningtime", "How long you listened, by track lengths", "Period (week, month, year…)"),
-    ("clock", "When you listen: weekday and hour, as a chart", "Period (week, month, year…)"),
-    ("unlinked", "Your top tracks ListenBrainz can't match to MusicBrainz", ""),
+/// Slash values are words the text parser (`stats::period`) reads.
+const PERIOD_CHOICES: [(&str, &str); 6] =
+    [("Weekly", "week"), ("Monthly", "month"), ("Quarterly", "quarter"), ("Half-yearly", "half"), ("Yearly", "year"), ("All time", "all")];
+const KIND_CHOICES: [(&str, &str); 3] = [("Artists", "artist"), ("Albums", "album"), ("Tracks", "track")];
+
+/// Slash versions of the history commands: (name, description).
+const HIST_SLASH: [(&str, &str); 29] = [
+    ("overview", "Your last days: plays, genres and top artist, album and track per day"),
+    ("streak", "Your current artist, album and track streak"),
+    ("streaks", "Your longest streaks"),
+    ("gaps", "What you came back to after the longest break"),
+    ("discoveries", "Artists you discovered recently"),
+    ("discoverydate", "When you first listened to something"),
+    ("lastlistened", "When you last listened to something"),
+    ("pace", "When you'll reach a play count"),
+    ("artistpace", "When you'll reach a play count for an artist"),
+    ("milestone", "Your nth listen"),
+    ("year", "Your year in music"),
+    ("recap", "Summary of a period"),
+    ("taste", "Compare your taste with someone"),
+    ("affinity", "Who in this server listens most like you"),
+    ("iceberg", "Your artists by how known they are on ListenBrainz"),
+    ("receipt", "Your top tracks as a receipt"),
+    ("overdue", "What you used to play often and haven't lately"),
+    ("comebacks", "What you came back to after a break"),
+    ("onthisday", "This day in earlier years, and songs released on it"),
+    ("movers", "What climbed your all-time top"),
+    ("growth", "Your plays per year, or per month of a year, as a chart"),
+    ("obsessions", "Your biggest days with one song, and one-song artists"),
+    ("hidden", "Tracks you play that few others on ListenBrainz do"),
+    ("obscurity", "How underground your artists are, and who here is most"),
+    ("servericeberg", "This server's top artists by how known they are"),
+    ("decades", "When the music you play came out, as a chart"),
+    ("listeningtime", "How long you listened, by track lengths"),
+    ("clock", "When you listen: weekday and hour, as a chart"),
+    ("unlinked", "Your top tracks ListenBrainz can't match to MusicBrainz"),
 ];
 
 fn parse_slash(data: &CommandData) -> Option<Cmd> {
@@ -349,11 +374,29 @@ fn parse_slash(data: &CommandData) -> Option<Cmd> {
                 ("lastlistened", Some("track")) => "llt",
                 _ => name,
             };
-            let mut rest = string("options").unwrap_or_default();
-            if let Some(CommandOptionValue::User(id)) = data.options.iter().find(|o| o.name == "user").map(|o| &o.value) {
-                rest = format!("<@{id}> {rest}");
+            if name == "artistpace" {
+                // Always "goal artist", untrimmed: goal 0 is "the next round number" (so "50 Cent" stays the artist),
+                // and an empty artist is what's playing.
+                let goal = data.options.iter().find_map(|o| match (o.name.as_str(), &o.value) {
+                    ("goal", CommandOptionValue::Integer(n)) => Some(*n),
+                    _ => None,
+                });
+                return parse_text(alias, &format!("{} {}", goal.unwrap_or(0), string("artist").unwrap_or_default()));
             }
-            parse_text(alias, rest.trim())
+            // Rebuilt as the text command's words; taste reads a leading mention.
+            let mut words: Vec<String> = Vec::new();
+            for o in &data.options {
+                match (o.name.as_str(), &o.value) {
+                    ("user", CommandOptionValue::User(id)) => words.insert(0, format!("<@{id}>")),
+                    ("type", _) if matches!(name, "discoverydate" | "lastlistened") => {}
+                    // growth reads a leading year.
+                    ("year", CommandOptionValue::Integer(n)) => words.insert(0, n.to_string()),
+                    (_, CommandOptionValue::Integer(n)) => words.push(n.to_string()),
+                    (_, CommandOptionValue::String(s)) if !s.trim().is_empty() => words.push(s.trim().to_owned()),
+                    _ => {}
+                }
+            }
+            parse_text(alias, words.join(" ").trim())
         }
         _ => None,
     }
@@ -478,19 +521,7 @@ impl Bot {
         let client = self.http.interaction(self.app_id);
         match &i.data {
             Some(InteractionData::ApplicationCommand(data)) if i.kind == InteractionType::ApplicationCommandAutocomplete => {
-                // Only `/timezone zone:` autocompletes: matches of what was typed, else the zones of the user's language.
-                let typed = data.options.iter().find_map(|o| match &o.value {
-                    CommandOptionValue::Focused(v, _) => Some(v.as_str()),
-                    _ => None,
-                });
-                let locales: Vec<&str> = [i.locale.as_deref(), i.guild_locale.as_deref()].into_iter().flatten().collect();
-                let choices = crate::tz::suggest(typed.unwrap_or_default(), &locales)
-                    .into_iter()
-                    .map(|zone| CommandOptionChoice { name: crate::tz::label(&zone), name_localizations: None, value: CommandOptionChoiceValue::String(zone) })
-                    .collect();
-                let data = InteractionResponseData { choices: Some(choices), ..Default::default() };
-                let resp = InteractionResponse { kind: InteractionResponseType::ApplicationCommandAutocompleteResult, data: Some(data) };
-                client.create_response(i.id, &i.token, &resp).await?;
+                return self.autocomplete(i, data).await;
             }
             Some(InteractionData::ApplicationCommand(data)) => {
                 let Some(cmd) = parse_slash(data) else { return Ok(()) };
@@ -607,6 +638,7 @@ impl Bot {
             return Ok(reply(format!("Invalid token. Paste the **User token** from {SETTINGS}.")));
         };
         let user_id = self.db().upsert_user(ctx.discord_id, &lb_name, token).await?;
+        self.forget_suggestions(user_id);
         if let Some(g) = ctx.guild {
             self.db().add_members(g, &[(ctx.discord_id, ctx.name.clone())]).await?;
         }
@@ -825,6 +857,7 @@ impl Bot {
                     return Ok(reply("Your data can't be deleted while your history is downloading. Try again shortly."));
                 }
                 self.db().delete_user(user.id).await?;
+                self.forget_suggestions(user.id);
                 Ok(reply("Your account and all your data were deleted."))
             }
             Cmd::Login | Cmd::Help | Cmd::Prefix(_) | Cmd::RefreshMembers | Cmd::FeaturedBlock | Cmd::Hist { .. } | Cmd::Chart { .. } => {
@@ -1205,6 +1238,36 @@ mod tests {
         assert!(matches!(parse_text("ac", ""), Some(Cmd::Chart { chart, artist: None, .. }) if chart.kind == Kind::Artist));
         assert!(matches!(parse_text("tc", ""), Some(Cmd::Chart { chart, .. }) if chart.kind == Kind::Track));
         assert!(matches!(parse_text("aoty", "2020"), Some(Cmd::Chart { chart, artist: None, .. }) if chart.year == Some(2020)));
+    }
+
+    #[test]
+    fn slash_options_become_text_words() {
+        use twilight_model::application::interaction::application_command::CommandDataOption;
+        let data = |name: &str, options: Vec<(&str, CommandOptionValue)>| CommandData {
+            guild_id: None,
+            id: Id::new(1),
+            name: name.into(),
+            kind: CommandType::ChatInput,
+            options: options.into_iter().map(|(n, value)| CommandDataOption { name: n.into(), value }).collect(),
+            resolved: None,
+            target_id: None,
+        };
+        let hist = |d| match parse_slash(&d) { Some(Cmd::Hist { arg, .. }) => arg, c => panic!("{c:?}") };
+        let s = |v: &str| CommandOptionValue::String(v.into());
+        assert_eq!(hist(data("artistpace", vec![("artist", s("Radiohead")), ("goal", CommandOptionValue::Integer(1000))])), "1000 Radiohead");
+        assert_eq!(hist(data("artistpace", vec![("artist", s("50 Cent"))])), "0 50 Cent");
+        assert_eq!(hist(data("artistpace", vec![("goal", CommandOptionValue::Integer(500))])), "500 ");
+        assert_eq!(hist(data("growth", vec![("artist", s("Radiohead")), ("year", CommandOptionValue::Integer(2025))])), "2025 Radiohead");
+        assert_eq!(hist(data("discoveries", vec![("time-period", s("year")), ("type", s("album"))])), "year album");
+        assert_eq!(hist(data("taste", vec![("user", CommandOptionValue::User(Id::new(5))), ("time-period", s("all"))])), "<@5> all");
+        assert_eq!(parse_slash(&data("lastlistened", vec![("type", s("artist")), ("query", s("Björk"))])),
+            Some(Cmd::Hist { cmd: Hc::LastListened, kind: Kind::Artist, arg: "Björk".into() }));
+        assert_eq!(parse_slash(&data("discoverydate", vec![("type", s("track")), ("query", s("a - b"))])),
+            Some(Cmd::Hist { cmd: Hc::DiscoveryDate, kind: Kind::Track, arg: "a - b".into() }));
+        for c in PERIOD_CHOICES {
+            assert!(crate::stats::period(c.1).is_some(), "{c:?}");
+        }
+        assert!(slash_commands().len() > HIST_SLASH.len());
     }
 
     #[test]

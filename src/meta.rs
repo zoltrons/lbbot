@@ -202,6 +202,7 @@ mod tests {
             chart_uses: Default::default(),
             featured: Default::default(),
             owner: None,
+            suggest_cache: Default::default(),
         }
     }
 

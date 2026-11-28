@@ -13,6 +13,7 @@ mod ingest;
 mod lb;
 mod meta;
 mod stats;
+mod suggest;
 mod tz;
 
 use std::{env, sync::Arc};
@@ -77,6 +78,7 @@ async fn main() -> Result<()> {
         featured,
         owner,
         chart_uses: Default::default(),
+        suggest_cache: Default::default(),
     });
 
     let intents = Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
@@ -109,6 +111,7 @@ async fn presence_loop(senders: Vec<twilight_gateway::MessageSender>, bot: Arc<b
             }),
             Err(e) => tracing::warn!(error = ?e, "bad presence"),
         }
+        bot.prune_suggestions();
         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
     }
 }
