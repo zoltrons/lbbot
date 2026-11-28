@@ -19,7 +19,7 @@ use twilight_model::{
         Message,
         message::{
             Component, Embed, MessageFlags,
-            component::{Label, TextDisplay, TextInput, TextInputStyle},
+            component::{ActionRow, Button, ButtonStyle, Label, TextDisplay, TextInput, TextInputStyle},
         },
     },
     gateway::payload::outgoing::RequestGuildMembers,
@@ -34,7 +34,7 @@ use twilight_util::builder::{
     embed::{EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder, ImageSource},
 };
 
-use crate::{db::{Db, Kind}, ingest::Ingest};
+use crate::{card::{V2, card}, db::{Db, Kind}, ingest::Ingest};
 
 const DEFAULT_PREFIX: &str = ",";
 const SETTINGS: &str = "[listenbrainz.org/settings](https://listenbrainz.org/settings/)";
@@ -151,13 +151,33 @@ impl From<Embed> for Out {
     }
 }
 
+impl Out {
+    pub(crate) fn card(&self) -> Vec<Component> {
+        card(&self.embed, &self.components)
+    }
+}
+
 fn failed(e: anyhow::Error) -> Out {
     error_reply(e).into()
 }
 
-pub(crate) fn login_first() -> Embed {
-    reply(format!("Connect your ListenBrainz account with `/login` first. You'll need your **User token** from {SETTINGS}."))
+/// fmbot's "Connect Last.fm account": the button opens the same token form as `/login`.
+pub(crate) fn login_first() -> Out {
+    let embed = reply(format!("Connect your ListenBrainz account first. You'll need your **User token** from {SETTINGS}."));
+    let button = Component::Button(Button {
+        custom_id: Some(LOGIN_BUTTON.into()),
+        disabled: false,
+        emoji: None,
+        id: None,
+        label: Some("Connect ListenBrainz account".into()),
+        sku_id: None,
+        style: ButtonStyle::Primary,
+        url: None,
+    });
+    Out { embed, components: vec![Component::ActionRow(ActionRow { components: vec![button], id: None })], files: Vec::new() }
 }
+
+const LOGIN_BUTTON: &str = "login";
 
 pub(crate) fn reply(text: impl Into<String>) -> Embed {
     EmbedBuilder::new().color(COLOR).description(text).build()
@@ -503,8 +523,8 @@ impl Bot {
         };
         self.http
             .create_message(msg.channel_id)
-            .embeds(&[out.embed])
-            .components(&out.components)
+            .flags(V2)
+            .components(&out.card())
             .attachments(&out.files)
             .reply(msg.id)
             .await?;
@@ -537,38 +557,13 @@ impl Bot {
                     return self.ephemeral(i, text).await;
                 }
                 if cmd == Cmd::Login {
-                    #[allow(deprecated)] // `label` now lives on the Label component
-                    let input = TextInput {
-                        custom_id: "token".into(),
-                        id: None,
-                        label: None,
-                        max_length: Some(100),
-                        min_length: Some(10),
-                        placeholder: Some("User token from listenbrainz.org/settings".into()),
-                        required: Some(true),
-                        style: TextInputStyle::Short,
-                        value: None,
-                    };
-                    let help = TextDisplay {
-                        content: format!(
-                            "Copy your **User token** from {SETTINGS}. It's stored encrypted, used once to download your history, and deleted when that's done."
-                        ),
-                        id: None,
-                    };
-                    let label = Label {
-                        component: Box::new(Component::TextInput(input)),
-                        description: None,
-                        id: None,
-                        label: "ListenBrainz token".into(),
-                    };
-                    let resp = ModalBuilder::new("login", "Connect to ListenBrainz", [Component::TextDisplay(help), Component::Label(label)]).build();
-                    client.create_response(i.id, &i.token, &resp).await?;
+                    client.create_response(i.id, &i.token, &login_modal()).await?;
                     return Ok(());
                 }
                 let ephemeral = matches!(cmd, Cmd::Privacy | Cmd::Remove { .. } | Cmd::Prefix(_) | Cmd::Chart { private: true, .. });
                 self.defer(i, ephemeral).await?;
                 let out = self.run(&ctx, cmd).await.unwrap_or_else(failed);
-                client.update_response(&i.token).embeds(Some(&[out.embed])).components(Some(&out.components)).attachments(&out.files).await?;
+                client.update_response(&i.token).flags(V2).components(Some(&out.card())).attachments(&out.files).await?;
             }
             Some(InteractionData::MessageComponent(data)) => {
                 if let Some((owner, chart)) = crate::chart::from_button(&data.custom_id) {
@@ -578,6 +573,10 @@ impl Bot {
                     client.create_response(i.id, &i.token, &crate::chart::modal(owner, &chart)).await?;
                     return Ok(());
                 }
+                if data.custom_id == LOGIN_BUTTON {
+                    client.create_response(i.id, &i.token, &login_modal()).await?;
+                    return Ok(());
+                }
                 let Some((owner, today, page)) = crate::hist::overview_button(&data.custom_id) else { return Ok(()) };
                 if owner != ctx.discord_id {
                     return self.ephemeral(i, "Only the person who ran the command can turn its pages.").await;
@@ -585,7 +584,8 @@ impl Bot {
                 let resp = InteractionResponse { kind: InteractionResponseType::DeferredUpdateMessage, data: None };
                 client.create_response(i.id, &i.token, &resp).await?;
                 let out = self.overview_turn(&ctx, today, page).await.unwrap_or_else(failed);
-                client.update_response(&i.token).embeds(Some(&[out.embed])).components(Some(&out.components)).await?;
+                // `embeds: []` clears the embed of a page sent before the cards.
+                client.update_response(&i.token).flags(V2).embeds(Some(&[])).components(Some(&out.card())).await?;
             }
             Some(InteractionData::ModalSubmit(data)) if data.custom_id.starts_with("chm:") => {
                 let value = |id: &str| data.components.iter().find_map(|c| modal_values(c, id)).unwrap_or_default();
@@ -598,15 +598,15 @@ impl Bot {
                 // An error keeps the Edit button, so a hiccup doesn't end the chart.
                 let out = self.chart(&ctx, &chart).await.unwrap_or_else(|e| Out { components: vec![crate::chart::edit_button(owner, &chart)], ..failed(e) });
                 // Keeping no old attachments drops the previous picture, also when the new reply has none.
-                let embeds = [out.embed];
-                let update = client.update_response(&i.token).embeds(Some(&embeds)).components(Some(&out.components));
+                let card = out.card();
+                let update = client.update_response(&i.token).flags(V2).embeds(Some(&[])).components(Some(&card));
                 update.keep_attachment_ids(&[]).attachments(&out.files).await?;
             }
             Some(InteractionData::ModalSubmit(data)) if data.custom_id == "login" => {
                 self.defer(i, true).await?;
                 let token = data.components.iter().find_map(|c| modal_values(c, "token")).and_then(|v| v.into_iter().next()).unwrap_or_default();
                 let out = self.login(&ctx, token.trim(), &i.token).await.unwrap_or_else(error_reply);
-                client.update_response(&i.token).embeds(Some(&[out])).await?;
+                client.update_response(&i.token).flags(V2).components(Some(&card(&out, &[]))).await?;
             }
             _ => {}
         }
@@ -615,7 +615,7 @@ impl Bot {
 
     /// A reply only the person who pressed or typed sees.
     async fn ephemeral(&self, i: &Interaction, text: &str) -> Result<()> {
-        let resp = ChannelMessageBuilder::new().embeds([reply(text)]).flags(MessageFlags::EPHEMERAL).build();
+        let resp = ChannelMessageBuilder::new().components(card(&reply(text), &[])).flags(MessageFlags::EPHEMERAL | V2).build();
         self.http.interaction(self.app_id).create_response(i.id, &i.token, &resp).await?;
         Ok(())
     }
@@ -669,12 +669,12 @@ impl Bot {
             };
             let sent = if started.elapsed() < std::time::Duration::from_secs(14 * 60) {
                 let client = http.interaction(app_id);
-                let embeds = [reply(text)];
-                client.create_followup(&interaction_token).flags(MessageFlags::EPHEMERAL).embeds(&embeds).await.map(drop).map_err(anyhow::Error::from)
+                let card = card(&reply(text), &[]);
+                client.create_followup(&interaction_token).flags(MessageFlags::EPHEMERAL | V2).components(&card).await.map(drop).map_err(anyhow::Error::from)
             } else {
                 async {
                     let channel = http.create_private_channel(Id::new(discord_id as u64)).await?.model().await?;
-                    http.create_message(channel.id).embeds(&[reply(text)]).await?;
+                    http.create_message(channel.id).flags(V2).components(&card(&reply(text), &[])).await?;
                     anyhow::Ok(())
                 }
                 .await
@@ -696,7 +696,7 @@ impl Bot {
         match cmd {
             Cmd::Hist { cmd, kind, arg } => match self.registered(ctx).await? {
                 Some(user) => self.hist(ctx, &user, cmd, kind, &arg).await,
-                None => Ok(login_first().into()),
+                None => Ok(login_first()),
             },
             Cmd::Chart { mut chart, artist, .. } => {
                 if let Some(name) = artist {
@@ -707,7 +707,12 @@ impl Bot {
                 }
                 self.chart(ctx, &chart).await
             }
-            cmd => Ok(self.run_embed(ctx, cmd).await?.into()),
+            Cmd::Help => Ok(reply(HELP).into()),
+            Cmd::Prefix(Some(p)) => Ok(self.set_prefix(ctx, &p).await?.into()),
+            cmd => match self.registered(ctx).await? {
+                Some(user) => Ok(self.run_embed(ctx, user, cmd).await?.into()),
+                None => Ok(login_first()),
+            },
         }
     }
 
@@ -720,21 +725,17 @@ impl Bot {
         Ok(user)
     }
 
-    async fn run_embed(&self, ctx: &Ctx, cmd: Cmd) -> Result<Embed> {
-        if cmd == Cmd::Help {
-            return Ok(reply(HELP));
+    async fn set_prefix(&self, ctx: &Ctx, p: &str) -> Result<Embed> {
+        let Some(g) = ctx.guild else { return Ok(reply("This command only works in servers.")) };
+        if p.chars().count() > 5 || p.contains('`') {
+            return Ok(reply("The prefix must be at most 5 characters and can't contain `."));
         }
-        if let Cmd::Prefix(Some(p)) = &cmd {
-            let Some(g) = ctx.guild else { return Ok(reply("This command only works in servers.")) };
-            if p.chars().count() > 5 || p.contains('`') {
-                return Ok(reply("The prefix must be at most 5 characters and can't contain `."));
-            }
-            self.db().set_prefix(g, p).await?;
-            self.prefixes.write().unwrap().insert(g, p.clone());
-            return Ok(reply(format!("The prefix is now `{p}`.")));
-        }
+        self.db().set_prefix(g, p).await?;
+        self.prefixes.write().unwrap().insert(g, p.to_owned());
+        Ok(reply(format!("The prefix is now `{p}`.")))
+    }
 
-        let Some(user) = self.registered(ctx).await? else { return Ok(login_first()) };
+    async fn run_embed(&self, ctx: &Ctx, user: crate::db::User, cmd: Cmd) -> Result<Embed> {
         let indexing_note = (!user.indexed).then_some("Your history is still downloading, so counts may be incomplete.");
 
         match cmd {
@@ -1162,6 +1163,35 @@ fn with_art(mut embed: EmbedBuilder, art: Art) -> Embed {
     embed.build()
 }
 
+/// `/login`'s form, also opened by the login card's button.
+fn login_modal() -> InteractionResponse {
+    #[allow(deprecated)] // `label` now lives on the Label component
+    let input = TextInput {
+        custom_id: "token".into(),
+        id: None,
+        label: None,
+        max_length: Some(100),
+        min_length: Some(10),
+        placeholder: Some("User token from listenbrainz.org/settings".into()),
+        required: Some(true),
+        style: TextInputStyle::Short,
+        value: None,
+    };
+    let help = TextDisplay {
+        content: format!(
+            "Copy your **User token** from {SETTINGS}. It's stored encrypted, used once to download your history, and deleted when that's done."
+        ),
+        id: None,
+    };
+    let label = Label {
+        component: Box::new(Component::TextInput(input)),
+        description: None,
+        id: None,
+        label: "ListenBrainz token".into(),
+    };
+    ModalBuilder::new("login", "Connect to ListenBrainz", [Component::TextDisplay(help), Component::Label(label)]).build()
+}
+
 /// The answer of the form field `id`: a text, or the picked options.
 fn modal_values(c: &ModalInteractionComponent, id: &str) -> Option<Vec<String>> {
     match c {
@@ -1176,7 +1206,7 @@ fn modal_values(c: &ModalInteractionComponent, id: &str) -> Option<Vec<String>> 
 
 /// Text of a `[text](url)` link. Discord shows backslash escapes there as they are ("Vignette \(Live\)"),
 /// so nothing is escaped; square brackets, which would end the link early, become round ones.
-fn link_text(s: &str) -> String {
+pub(crate) fn link_text(s: &str) -> String {
     s.replace('[', "(").replace(']', ")")
 }
 

@@ -1,4 +1,5 @@
 mod bot;
+mod card;
 mod chart;
 mod crypto;
 mod db;
@@ -52,7 +53,9 @@ async fn main() -> Result<()> {
         ingest.spawn_index(id);
     }
 
-    let http = Arc::new(twilight_http::Client::new(token.clone()));
+    // Replies echo what users type and show text displays, which ping like message text: no mention pings anyone.
+    let none = twilight_model::channel::message::AllowedMentions::default();
+    let http = Arc::new(twilight_http::Client::builder().token(token.clone()).default_allowed_mentions(none).build());
     let app = http.current_user_application().await?.model().await?;
     let app_id = app.id;
     // For a team app, `owner` is a placeholder user; the team owner is the real one.

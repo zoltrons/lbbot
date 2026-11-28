@@ -445,7 +445,7 @@ impl Bot {
         if let Some(why) = c.invalid() {
             return Ok(with_edit(reply(why)));
         }
-        let Some(me) = self.registered(ctx).await? else { return Ok(login_first().into()) };
+        let Some(me) = self.registered(ctx).await? else { return Ok(login_first()) };
         if !allow(&mut self.chart_uses.lock().unwrap(), ctx.discord_id, std::time::Instant::now()) {
             return Ok(with_edit(reply("That's a lot of charts at once. Try again in a bit.")));
         }

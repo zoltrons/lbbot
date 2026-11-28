@@ -26,3 +26,6 @@ twilight-model = "0.18.0"
 twilight-util = { version = "0.18.0", features = ["builder"] }
 zip = "9.8.2"
 zstd = "0.14.5"
+
+[dev-dependencies]
+twilight-validate = "0.18.0"
